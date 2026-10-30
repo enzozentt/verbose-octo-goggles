@@ -1,6 +1,6 @@
 --!strict
 --[[
-	TacticalHUD v3 — spectator / teammate / debug overlay with a tabbed menu.
+	TacticalHUD v4 — spectator / teammate / debug overlay with a tabbed menu.
 
 	Place as a LocalScript in StarterPlayer > StarterPlayerScripts.
 
@@ -140,6 +140,7 @@ local Config = {
 	MenuStartsVisible = true,
 	MenuScale = 1,
 	MenuOpacity = 0.06,
+	AnimatedBorder = true,
 	Accent = Color3.fromRGB(0, 220, 255),
 }
 
@@ -338,17 +339,53 @@ end
 ----------------------------------------------------------------------
 local localPlayer = Players.LocalPlayer
 
+-- Hover tooltips shown in the menu footer, keyed by control label.
+local Tips: { [string]: string } = {
+	["HUD enabled"] = "Master switch for every world overlay",
+	["Mode"] = "Track everyone, or only your team",
+	["Teamless counts as ally"] = "In games without teams, treat everyone as a teammate",
+	["Boxes"] = "Corner-bracket box that scales with distance and FOV",
+	["Box style"] = "Corner brackets or a full outline",
+	["Tracers"] = "Line from the screen edge to each target",
+	["Tracer origin"] = "Where tracers start",
+	["Names"] = "Name tag above the target",
+	["Health bars"] = "Health bar with damage trail (close targets only)",
+	["Distance"] = "Distance readout in metres",
+	["Chams (highlight)"] = "Highlight through walls. Roblox caps this at 31 at once",
+	["Off-screen arrows"] = "Arrows pointing at targets outside your view",
+	["Max range"] = "Targets beyond this are culled entirely",
+	["Screen radius"] = "Only targets this many pixels from screen centre are drawn",
+	["Occlusion raycast"] = "Hide targets behind walls (a throttled raycast per target)",
+	["Radar"] = "Top-down minimap that rotates with your camera",
+	["Crosshair"] = "Custom centre crosshair",
+	["Watermark (FPS / ping)"] = "Top-centre status pill",
+	["Focus card"] = "Details for the target nearest your crosshair",
+	["Focus ring"] = "Shows the focus detection radius",
+	["Max active tags"] = "Hard cap on simultaneous pooled tags",
+	["Preset"] = "Pick a preset, then press Apply",
+	["Animated border"] = "Rotating gradient around the menu",
+	["Accent hue"] = "Drag across the spectrum to recolour the whole UI",
+	["Unload HUD"] = "Destroys the HUD and disconnects every signal",
+}
+
 local function createMenu(janitor: Janitor, onChange: () -> ()): any
 	local menu: any = {}
 	local accentRefs = {} :: { { Inst: any, Prop: string } }
 	local refreshers = {} :: { () -> () }
-	local tabs = {} :: { { Page: ScrollingFrame, Bar: Frame, Label: TextLabel, Button: TextButton } }
+	local tabsData = {} :: { any }
+	local current = 0
 	local activeDrag: ((InputObject) -> ())? = nil
+	local activeEnd: (() -> ())? = nil
 	local listening: { Button: TextButton, Set: (Enum.KeyCode) -> () }? = nil
 	local shown = Config.MenuStartsVisible
+	local minimized = false
 	local showToken = 0
-	local tweenInfo = TweenInfo.new(0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+	local fast = TweenInfo.new(0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+	local med = TweenInfo.new(0.22, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
 
+	local function tween(inst: Instance, info: TweenInfo, props: { [string]: any })
+		TweenService:Create(inst, info, props):Play()
+	end
 	local function accent(inst: any, prop: string)
 		table.insert(accentRefs, { Inst = inst, Prop = prop })
 		inst[prop] = Theme.Accent
@@ -372,14 +409,35 @@ local function createMenu(janitor: Janitor, onChange: () -> ()): any
 	}, localPlayer:WaitForChild("PlayerGui"))
 	menu.Gui = gui
 
+	local FULL_H, WIDTH = 440, 660
 	local window = New("Frame", {
 		Name = "Window", AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
-		Size = UDim2.fromOffset(640, 420), BackgroundTransparency = 1,
+		Size = UDim2.fromOffset(WIDTH, FULL_H), BackgroundTransparency = 1,
 	}, gui)
 	local scale = New("UIScale", { Scale = Config.MenuScale }, window)
+
+	-- Soft neon glow: stacked translucent rounded frames behind the body
+	for i = 1, 4 do
+		local g = New("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+			Size = UDim2.new(1, i * 10, 1, i * 10), BackgroundTransparency = 0.88 + i * 0.022, BorderSizePixel = 0,
+		}, window)
+		accent(g, "BackgroundColor3")
+		New("UICorner", { CornerRadius = UDim.new(0, 12 + i * 5) }, g)
+	end
+
 	New("UICorner", { CornerRadius = UDim.new(0, 12) }, window)
-	local stroke = New("UIStroke", { Thickness = 1.5, Transparency = 0.45 }, window)
-	accent(stroke, "Color")
+	local stroke = New("UIStroke", { Thickness = 2, Transparency = 0.1, Color = Color3.new(1, 1, 1) }, window)
+	local borderGrad = New("UIGradient", {}, stroke)
+	local function borderSeq(): ColorSequence
+		local dark = Theme.Accent:Lerp(Color3.new(0, 0, 0), 0.8)
+		return ColorSequence.new({
+			ColorSequenceKeypoint.new(0, Theme.Accent),
+			ColorSequenceKeypoint.new(0.5, dark),
+			ColorSequenceKeypoint.new(1, Theme.Accent),
+		})
+	end
+	borderGrad.Color = borderSeq()
 
 	local body = New("CanvasGroup", {
 		Size = UDim2.fromScale(1, 1), BackgroundColor3 = Theme.Bg,
@@ -387,78 +445,153 @@ local function createMenu(janitor: Janitor, onChange: () -> ()): any
 	}, window)
 	New("UICorner", { CornerRadius = UDim.new(0, 12) }, body)
 
-	-- Title bar (drag handle)
+	-- Title bar ------------------------------------------------------------
 	local titleBar = New("TextButton", {
-		Size = UDim2.new(1, -50, 0, 42), BackgroundTransparency = 1, Text = "", AutoButtonColor = false,
+		Size = UDim2.new(1, -240, 0, 42), BackgroundTransparency = 1, Text = "", AutoButtonColor = false,
 	}, body)
-	local title = New("TextLabel", {
-		BackgroundTransparency = 1, Position = UDim2.fromOffset(16, 0), Size = UDim2.new(0, 150, 1, 0),
-		Font = Enum.Font.GothamBlack, TextSize = 16, TextXAlignment = Enum.TextXAlignment.Left,
-		Text = "TACTICAL HUD",
+	local logo = New("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromOffset(27, 21), Size = UDim2.fromOffset(15, 15),
+		Rotation = 45, BorderSizePixel = 0,
 	}, titleBar)
-	accent(title, "TextColor3")
-	New("TextLabel", {
-		BackgroundTransparency = 1, Position = UDim2.fromOffset(150, 2), Size = UDim2.new(1, -150, 1, 0),
-		Font = Enum.Font.GothamMedium, TextSize = 11, TextColor3 = Theme.Muted,
-		TextXAlignment = Enum.TextXAlignment.Left, Text = "v3  |  drag to move",
-	}, titleBar)
+	accent(logo, "BackgroundColor3")
+	New("UICorner", { CornerRadius = UDim.new(0, 4) }, logo)
 	New("Frame", {
-		Position = UDim2.fromOffset(0, 42), Size = UDim2.new(1, 0, 0, 1),
-		BackgroundColor3 = Theme.Stroke, BorderSizePixel = 0,
-	}, body)
+		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(5, 5),
+		BackgroundColor3 = Theme.Bg, BorderSizePixel = 0,
+	}, logo)
+	local title = New("TextLabel", {
+		BackgroundTransparency = 1, Position = UDim2.fromOffset(46, 5), Size = UDim2.new(0, 160, 0, 20),
+		Font = Enum.Font.GothamBlack, TextSize = 16, TextColor3 = Color3.new(1, 1, 1),
+		TextXAlignment = Enum.TextXAlignment.Left, Text = "TACTICAL HUD",
+	}, titleBar)
+	local titleGrad = New("UIGradient", { Color = ColorSequence.new(Theme.Accent, Color3.new(1, 1, 1)) }, title)
+	New("TextLabel", {
+		BackgroundTransparency = 1, Position = UDim2.fromOffset(46, 23), Size = UDim2.new(0, 200, 0, 14),
+		Font = Enum.Font.GothamMedium, TextSize = 10, TextColor3 = Theme.Muted,
+		TextXAlignment = Enum.TextXAlignment.Left, Text = "SPECTATOR SUITE  v4",
+	}, titleBar)
 
-	local closeBtn = New("TextButton", {
-		AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -8, 0, 7), Size = UDim2.fromOffset(28, 28),
-		BackgroundColor3 = Theme.Row, Text = "×", Font = Enum.Font.GothamBold, TextSize = 20,
-		TextColor3 = Theme.Text, AutoButtonColor = true, BorderSizePixel = 0,
+	local chip = New("TextLabel", {
+		AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -78, 0, 10), Size = UDim2.fromOffset(150, 22),
+		BackgroundColor3 = Theme.Row, BorderSizePixel = 0, Font = Enum.Font.GothamBold, TextSize = 11,
+		TextColor3 = Theme.Muted, Text = "-- FPS  |  -- ms",
 	}, body)
-	New("UICorner", { CornerRadius = UDim.new(0, 7) }, closeBtn)
+	New("UICorner", { CornerRadius = UDim.new(1, 0) }, chip)
 
-	-- Sidebar + content
+	local function headerButton(text: string, x: number): TextButton
+		local b = New("TextButton", {
+			AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, x, 0, 7), Size = UDim2.fromOffset(28, 28),
+			BackgroundColor3 = Theme.Row, Text = text, Font = Enum.Font.GothamBold, TextSize = 18,
+			TextColor3 = Theme.Text, AutoButtonColor = false, BorderSizePixel = 0,
+		}, body)
+		New("UICorner", { CornerRadius = UDim.new(0, 7) }, b)
+		janitor:Add(b.MouseEnter:Connect(function()
+			tween(b, fast, { BackgroundColor3 = Theme.RowHover })
+		end))
+		janitor:Add(b.MouseLeave:Connect(function()
+			tween(b, fast, { BackgroundColor3 = Theme.Row })
+		end))
+		return b
+	end
+	local minBtn = headerButton("-", -42)
+	local closeBtn = headerButton("×", -8)
+
+	local rule = New("Frame", {
+		Position = UDim2.fromOffset(0, 42), Size = UDim2.new(1, 0, 0, 1), BorderSizePixel = 0,
+	}, body)
+	accent(rule, "BackgroundColor3")
+	New("UIGradient", { Transparency = NumberSequence.new(0.1, 1) }, rule)
+
+	-- Sidebar (search + tabs + sliding selector) --------------------------
 	local sidebar = New("Frame", {
 		Position = UDim2.fromOffset(0, 43), Size = UDim2.new(0, 140, 1, -43),
-		BackgroundColor3 = Theme.Side, BackgroundTransparency = 0.2, BorderSizePixel = 0,
+		BackgroundColor3 = Theme.Side, BackgroundTransparency = 0.3, BorderSizePixel = 0,
 	}, body)
-	New("UIPadding", {
-		PaddingTop = UDim.new(0, 10), PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8),
+
+	local search = New("TextBox", {
+		Position = UDim2.fromOffset(8, 10), Size = UDim2.new(1, -16, 0, 28), BackgroundColor3 = Theme.Row,
+		BorderSizePixel = 0, Font = Enum.Font.GothamMedium, TextSize = 12, TextColor3 = Theme.Text,
+		PlaceholderText = "Search...", PlaceholderColor3 = Theme.Muted, Text = "", ClearTextOnFocus = false,
+		TextXAlignment = Enum.TextXAlignment.Left,
 	}, sidebar)
-	New("UIListLayout", { Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder }, sidebar)
+	New("UICorner", { CornerRadius = UDim.new(0, 7) }, search)
+	New("UIPadding", { PaddingLeft = UDim.new(0, 10) }, search)
+	local searchStroke = New("UIStroke", { Thickness = 1, Transparency = 0.6, Color = Theme.Stroke }, search)
+	janitor:Add(search.Focused:Connect(function()
+		tween(searchStroke, fast, { Transparency = 0, Color = Theme.Accent })
+	end))
+	janitor:Add(search.FocusLost:Connect(function()
+		tween(searchStroke, fast, { Transparency = 0.6, Color = Theme.Stroke })
+	end))
+
+	local selector = New("Frame", {
+		Position = UDim2.new(0, 8, 0, 48), Size = UDim2.new(1, -16, 0, 36), BackgroundTransparency = 0.86, BorderSizePixel = 0,
+	}, sidebar)
+	accent(selector, "BackgroundColor3")
+	New("UICorner", { CornerRadius = UDim.new(0, 8) }, selector)
+	local selBar = New("Frame", {
+		AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.fromScale(0, 0.5), Size = UDim2.new(0, 3, 0.55, 0), BorderSizePixel = 0,
+	}, selector)
+	accent(selBar, "BackgroundColor3")
+	New("UICorner", { CornerRadius = UDim.new(1, 0) }, selBar)
 
 	local hint = New("TextLabel", {
-		AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 10, 1, -8), Size = UDim2.new(0, 120, 0, 28),
+		AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 12, 1, -8), Size = UDim2.new(0, 120, 0, 28),
 		BackgroundTransparency = 1, Font = Enum.Font.Gotham, TextSize = 10, TextColor3 = Theme.Muted,
 		TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Bottom,
 		TextWrapped = true, Text = "",
-	}, body)
+	}, sidebar)
 	register(function()
 		hint.Text = ("%s HUD  |  %s menu"):format(Config.ToggleHudKey.Name, Config.ToggleMenuKey.Name)
 	end)
 
+	-- Content + footer ---------------------------------------------------
 	local content = New("Frame", {
-		Position = UDim2.fromOffset(140, 43), Size = UDim2.new(1, -140, 1, -43),
+		Position = UDim2.fromOffset(140, 43), Size = UDim2.new(1, -140, 1, -65),
 		BackgroundTransparency = 1, ClipsDescendants = true,
 	}, body)
+	local footer = New("Frame", {
+		AnchorPoint = Vector2.new(0, 1), Position = UDim2.fromScale(0, 1), Size = UDim2.new(1, 0, 0, 22),
+		BackgroundTransparency = 1,
+	}, body)
+	local footerShift = New("Frame", {
+		Position = UDim2.fromOffset(140, 0), Size = UDim2.new(1, -140, 1, 0), BackgroundColor3 = Theme.Side,
+		BackgroundTransparency = 0.3, BorderSizePixel = 0,
+	}, footer)
+	local tipLabel = New("TextLabel", {
+		BackgroundTransparency = 1, Position = UDim2.fromOffset(12, 0), Size = UDim2.new(1, -24, 1, 0),
+		Font = Enum.Font.GothamMedium, TextSize = 11, TextColor3 = Theme.Muted,
+		TextXAlignment = Enum.TextXAlignment.Left, Text = "",
+	}, footerShift)
+	function menu.SetTip(text: string)
+		tipLabel.Text = text
+	end
 
+	-- Toast: slides up, fades out
 	local toast = New("TextLabel", {
-		AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.new(0.5, 0, 1, -10), AutomaticSize = Enum.AutomaticSize.XY,
+		AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.new(0.5, 70, 1, -20), AutomaticSize = Enum.AutomaticSize.XY,
 		BackgroundColor3 = Theme.RowHover, BackgroundTransparency = 1, TextTransparency = 1, ZIndex = 10,
 		Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = Theme.Text, Text = "",
-	}, content)
+	}, body)
 	New("UIPadding", {
-		PaddingTop = UDim.new(0, 6), PaddingBottom = UDim.new(0, 6),
-		PaddingLeft = UDim.new(0, 14), PaddingRight = UDim.new(0, 14),
+		PaddingTop = UDim.new(0, 7), PaddingBottom = UDim.new(0, 7),
+		PaddingLeft = UDim.new(0, 16), PaddingRight = UDim.new(0, 16),
 	}, toast)
 	New("UICorner", { CornerRadius = UDim.new(1, 0) }, toast)
+	local toastStroke = New("UIStroke", { Thickness = 1, Transparency = 1 }, toast)
+	accent(toastStroke, "Color")
 	local toastToken = 0
 	function menu.Toast(text: string)
 		toastToken += 1
 		local token = toastToken
 		toast.Text = text
-		toast.BackgroundTransparency = 0.1
-		toast.TextTransparency = 0
-		task.delay(1.6, function()
+		toast.Position = UDim2.new(0.5, 70, 1, -10)
+		toast.BackgroundTransparency, toast.TextTransparency, toastStroke.Transparency = 0.05, 0, 0.2
+		tween(toast, med, { Position = UDim2.new(0.5, 70, 1, -30) })
+		task.delay(1.7, function()
 			if token == toastToken and toast.Parent then
-				TweenService:Create(toast, tweenInfo, { BackgroundTransparency = 1, TextTransparency = 1 }):Play()
+				tween(toast, med, { BackgroundTransparency = 1, TextTransparency = 1 })
+				tween(toastStroke, med, { Transparency = 1 })
 			end
 		end)
 	end
@@ -471,12 +604,12 @@ local function createMenu(janitor: Janitor, onChange: () -> ()): any
 		if v then
 			gui.Enabled = true
 			body.GroupTransparency = 1
-			scale.Scale = Config.MenuScale * 0.94
-			TweenService:Create(body, tweenInfo, { GroupTransparency = 0 }):Play()
-			TweenService:Create(scale, tweenInfo, { Scale = Config.MenuScale }):Play()
+			scale.Scale = Config.MenuScale * 0.9
+			tween(body, med, { GroupTransparency = 0 })
+			tween(scale, TweenInfo.new(0.32, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Scale = Config.MenuScale })
 		else
-			TweenService:Create(body, tweenInfo, { GroupTransparency = 1 }):Play()
-			TweenService:Create(scale, tweenInfo, { Scale = Config.MenuScale * 0.94 }):Play()
+			tween(body, fast, { GroupTransparency = 1 })
+			tween(scale, fast, { Scale = Config.MenuScale * 0.94 })
 			task.delay(0.16, function()
 				if token == showToken then
 					gui.Enabled = false
@@ -487,11 +620,22 @@ local function createMenu(janitor: Janitor, onChange: () -> ()): any
 	function menu.Toggle()
 		menu.SetVisible(not shown)
 	end
+
+	local function updateTabColors()
+		for i, t in tabsData do
+			local active = i == current
+			t.Label.TextColor3 = if active then Theme.Text else Theme.Muted
+			t.Icon.TextColor3 = if active then Theme.Accent else Theme.Muted
+		end
+	end
 	function menu.SetAccent(c: Color3)
 		Theme.Accent = c
 		for _, ref in accentRefs do
 			ref.Inst[ref.Prop] = c
 		end
+		borderGrad.Color = borderSeq()
+		titleGrad.Color = ColorSequence.new(c, Color3.new(1, 1, 1))
+		updateTabColors()
 		refreshAll()
 	end
 	function menu.SetScale(s: number)
@@ -504,6 +648,23 @@ local function createMenu(janitor: Janitor, onChange: () -> ()): any
 		gui:Destroy()
 	end
 
+	-- Live header chip + animated border (only while the menu is open)
+	local fpsFrames, fpsTimer = 0, 0
+	janitor:Add(RunService.RenderStepped:Connect(function(dt)
+		if not shown then
+			return
+		end
+		if Config.AnimatedBorder then
+			borderGrad.Rotation = (os.clock() * 45) % 360
+		end
+		fpsFrames += 1
+		fpsTimer += dt
+		if fpsTimer >= 0.5 then
+			chip.Text = string.format("%d FPS  |  %d ms", math.floor(fpsFrames / fpsTimer + 0.5), math.floor(localPlayer:GetNetworkPing() * 1000))
+			fpsFrames, fpsTimer = 0, 0
+		end
+	end))
+
 	-- Global input plumbing (drag + key capture) ------------------------
 	janitor:Add(UserInputService.InputChanged:Connect(function(input)
 		if activeDrag and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
@@ -513,6 +674,10 @@ local function createMenu(janitor: Janitor, onChange: () -> ()): any
 	janitor:Add(UserInputService.InputEnded:Connect(function(input)
 		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
 			activeDrag = nil
+			if activeEnd then
+				activeEnd()
+				activeEnd = nil
+			end
 		end
 	end))
 
@@ -545,42 +710,104 @@ local function createMenu(janitor: Janitor, onChange: () -> ()): any
 	janitor:Add(closeBtn.Activated:Connect(function()
 		menu.SetVisible(false)
 	end))
+	janitor:Add(minBtn.Activated:Connect(function()
+		minimized = not minimized
+		minBtn.Text = if minimized then "+" else "-"
+		tween(window, TweenInfo.new(0.26, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), {
+			Size = UDim2.fromOffset(WIDTH, if minimized then 44 else FULL_H),
+		})
+	end))
 
 	-- Tabs ---------------------------------------------------------------
-	local function selectTab(index: number)
-		for i, t in tabs do
-			local active = i == index
-			t.Page.Visible = active
-			t.Bar.Visible = active
-			t.Label.TextColor3 = if active then Theme.Text else Theme.Muted
-			t.Button.BackgroundTransparency = if active then 0.35 else 1
+	local function selectTab(index: number, instant: boolean?)
+		current = index
+		for i, t in tabsData do
+			if i == index then
+				t.Wrapper.Visible = true
+				if instant then
+					t.Wrapper.GroupTransparency = 0
+					t.Wrapper.Position = UDim2.new()
+				else
+					t.Wrapper.GroupTransparency = 1
+					t.Wrapper.Position = UDim2.fromOffset(0, 14)
+					tween(t.Wrapper, med, { GroupTransparency = 0, Position = UDim2.new() })
+				end
+			else
+				t.Wrapper.Visible = false
+			end
 		end
+		local target = UDim2.new(0, 8, 0, tabsData[index].Y)
+		if instant then
+			selector.Position = target
+		else
+			tween(selector, TweenInfo.new(0.26, Enum.EasingStyle.Quint, Enum.EasingDirection.Out), { Position = target })
+		end
+		updateTabColors()
 	end
 
-	function menu.AddTab(name: string): any
-		local index = #tabs + 1
+	-- Search + section collapse share one visibility pass.
+	local function applyFilter()
+		local q = search.Text:lower()
+		local firstHit: number? = nil
+		for i, t in tabsData do
+			local count = 0
+			for _, r in t.Rows do
+				local match = q == "" or r.Text:find(q, 1, true) ~= nil
+				if match then
+					count += 1
+				end
+				local collapsed = q == "" and r.Section ~= nil and r.Section.Collapsed
+				r.Row.Visible = match and not collapsed
+			end
+			for _, h in t.Headers do
+				h.Visible = q == ""
+			end
+			t.Count = count
+			t.Badge.Visible = q ~= "" and count > 0
+			t.Badge.Text = tostring(count)
+			local dim = if q ~= "" and count == 0 then 0.65 else 0
+			t.Label.TextTransparency, t.Icon.TextTransparency = dim, dim
+			if q ~= "" and count > 0 and not firstHit then
+				firstHit = i
+			end
+		end
+		if q ~= "" and current > 0 and tabsData[current].Count == 0 and firstHit then
+			selectTab(firstHit)
+		end
+	end
+	janitor:Add(search:GetPropertyChangedSignal("Text"):Connect(applyFilter))
+
+	function menu.AddTab(name: string, icon: string?): any
+		local index = #tabsData + 1
+		local y = 48 + (index - 1) * 40
 		local btn = New("TextButton", {
-			Size = UDim2.new(1, 0, 0, 36), BackgroundColor3 = Theme.Row, BackgroundTransparency = 1,
-			Text = "", AutoButtonColor = false, BorderSizePixel = 0, LayoutOrder = index,
+			Position = UDim2.new(0, 8, 0, y), Size = UDim2.new(1, -16, 0, 36), BackgroundColor3 = Theme.Row,
+			BackgroundTransparency = 1, Text = "", AutoButtonColor = false, BorderSizePixel = 0, ZIndex = 2,
 		}, sidebar)
 		New("UICorner", { CornerRadius = UDim.new(0, 8) }, btn)
+		local iconLabel = New("TextLabel", {
+			BackgroundTransparency = 1, Position = UDim2.fromOffset(12, 0), Size = UDim2.new(0, 18, 1, 0),
+			Font = Enum.Font.GothamBold, TextSize = 14, TextColor3 = Theme.Muted, Text = icon or "●", ZIndex = 3,
+		}, btn)
 		local label = New("TextLabel", {
-			BackgroundTransparency = 1, Position = UDim2.fromOffset(16, 0), Size = UDim2.new(1, -16, 1, 0),
+			BackgroundTransparency = 1, Position = UDim2.fromOffset(36, 0), Size = UDim2.new(1, -62, 1, 0),
 			Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = Theme.Muted,
-			TextXAlignment = Enum.TextXAlignment.Left, Text = name:upper(),
+			TextXAlignment = Enum.TextXAlignment.Left, Text = name:upper(), ZIndex = 3,
 		}, btn)
-		local bar = New("Frame", {
-			AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.fromScale(0, 0.5), Size = UDim2.new(0, 3, 0.55, 0),
-			BorderSizePixel = 0, Visible = false,
+		local badge = New("TextLabel", {
+			AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -8, 0.5, 0), Size = UDim2.fromOffset(22, 16),
+			BackgroundColor3 = Theme.Off, BorderSizePixel = 0, Font = Enum.Font.GothamBold, TextSize = 10,
+			TextColor3 = Theme.Text, Visible = false, Text = "0", ZIndex = 3,
 		}, btn)
-		accent(bar, "BackgroundColor3")
-		New("UICorner", { CornerRadius = UDim.new(1, 0) }, bar)
+		New("UICorner", { CornerRadius = UDim.new(1, 0) }, badge)
 
+		local wrapper = New("CanvasGroup", {
+			Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Visible = false, GroupTransparency = 1,
+		}, content)
 		local page = New("ScrollingFrame", {
 			Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, BorderSizePixel = 0,
-			ScrollBarThickness = 3, AutomaticCanvasSize = Enum.AutomaticSize.Y,
-			CanvasSize = UDim2.new(), Visible = false,
-		}, content)
+			ScrollBarThickness = 3, AutomaticCanvasSize = Enum.AutomaticSize.Y, CanvasSize = UDim2.new(),
+		}, wrapper)
 		accent(page, "ScrollBarImageColor3")
 		New("UIPadding", {
 			PaddingTop = UDim.new(0, 10), PaddingBottom = UDim.new(0, 14),
@@ -588,77 +815,141 @@ local function createMenu(janitor: Janitor, onChange: () -> ()): any
 		}, page)
 		New("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, page)
 
-		tabs[index] = { Page = page, Bar = bar, Label = label, Button = btn }
+		local td: any = {
+			Button = btn, Icon = iconLabel, Label = label, Badge = badge, Wrapper = wrapper, Page = page,
+			Rows = {}, Headers = {}, Y = y, Count = 0,
+		}
+		tabsData[index] = td
 		janitor:Add(btn.Activated:Connect(function()
-			selectTab(index)
+			if current ~= index then
+				selectTab(index)
+			end
+		end))
+		janitor:Add(btn.MouseEnter:Connect(function()
+			if current ~= index then
+				tween(btn, fast, { BackgroundTransparency = 0.6 })
+			end
+		end))
+		janitor:Add(btn.MouseLeave:Connect(function()
+			tween(btn, fast, { BackgroundTransparency = 1 })
 		end))
 		if index == 1 then
-			selectTab(1)
+			selectTab(1, true)
 		end
 
 		local tab: any = {}
 		local order = 0
+		local curSection: any = nil
 		local function nextOrder(): number
 			order += 1
 			return order
 		end
-		local function makeRow(height: number): Frame
+
+		-- Returns the row and a hover binder. A refcount keeps hover stable when
+		-- the cursor moves between the row and the buttons layered on top of it.
+		local function makeRow(height: number, text: string): (Frame, (GuiObject) -> ())
 			local r = New("Frame", {
 				Size = UDim2.new(1, 0, 0, height), BackgroundColor3 = Theme.Row,
 				BorderSizePixel = 0, LayoutOrder = nextOrder(),
 			}, page)
 			New("UICorner", { CornerRadius = UDim.new(0, 7) }, r)
-			return r
+			local edge = New("Frame", {
+				AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.fromScale(0, 0.5), Size = UDim2.new(0, 3, 0, 0), BorderSizePixel = 0,
+			}, r)
+			accent(edge, "BackgroundColor3")
+			New("UICorner", { CornerRadius = UDim.new(1, 0) }, edge)
+			table.insert(td.Rows, { Row = r, Text = (text .. " " .. (if curSection then curSection.Title else "")):lower(), Section = curSection })
+
+			local count = 0
+			local function setHover(on: boolean)
+				tween(r, fast, { BackgroundColor3 = if on then Theme.RowHover else Theme.Row })
+				tween(edge, fast, { Size = if on then UDim2.new(0, 3, 0.6, 0) else UDim2.new(0, 3, 0, 0) })
+				menu.SetTip(if on then (Tips[text] or "") else "")
+			end
+			local function hov(obj: GuiObject)
+				janitor:Add(obj.MouseEnter:Connect(function()
+					count += 1
+					if count == 1 then
+						setHover(true)
+					end
+				end))
+				janitor:Add(obj.MouseLeave:Connect(function()
+					count = math.max(0, count - 1)
+					if count == 0 then
+						setHover(false)
+					end
+				end))
+			end
+			hov(r)
+			return r, hov
 		end
 		local function rowLabel(row: Frame, text: string, widthOffset: number): TextLabel
 			return New("TextLabel", {
-				BackgroundTransparency = 1, Position = UDim2.fromOffset(12, 0), Size = UDim2.new(1, widthOffset, 1, 0),
+				BackgroundTransparency = 1, Position = UDim2.fromOffset(14, 0), Size = UDim2.new(1, widthOffset, 1, 0),
 				Font = Enum.Font.GothamMedium, TextSize = 13, TextColor3 = Theme.Text,
 				TextXAlignment = Enum.TextXAlignment.Left, Text = text,
 			}, row)
 		end
-		local function hover(btn: GuiButton, row: Frame)
-			janitor:Add(btn.MouseEnter:Connect(function()
-				row.BackgroundColor3 = Theme.RowHover
-			end))
-			janitor:Add(btn.MouseLeave:Connect(function()
-				row.BackgroundColor3 = Theme.Row
-			end))
-		end
 		local function small(parent: Instance, text: string, size: UDim2): TextButton
 			local b = New("TextButton", {
 				Size = size, BackgroundColor3 = Theme.Off, BorderSizePixel = 0, Text = text,
-				Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = Theme.Text, AutoButtonColor = true,
+				Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = Theme.Text, AutoButtonColor = false,
 			}, parent)
 			New("UICorner", { CornerRadius = UDim.new(0, 6) }, b)
+			janitor:Add(b.MouseEnter:Connect(function()
+				tween(b, fast, { BackgroundColor3 = Theme.Stroke })
+			end))
+			janitor:Add(b.MouseLeave:Connect(function()
+				tween(b, fast, { BackgroundColor3 = Theme.Off })
+			end))
 			return b
 		end
 
+		-- Collapsible section header
 		function tab.Section(titleText: string)
-			local f = New("Frame", { Size = UDim2.new(1, 0, 0, 26), BackgroundTransparency = 1, LayoutOrder = nextOrder() }, page)
+			local sec = { Collapsed = false, Title = titleText:lower() }
+			curSection = sec
+			local f = New("TextButton", {
+				Size = UDim2.new(1, 0, 0, 28), BackgroundTransparency = 1, Text = "", AutoButtonColor = false, LayoutOrder = nextOrder(),
+			}, page)
+			local chev = New("TextLabel", {
+				BackgroundTransparency = 1, Size = UDim2.new(0, 16, 1, -4), Font = Enum.Font.GothamBold, TextSize = 11,
+				TextYAlignment = Enum.TextYAlignment.Bottom, Text = "▾",
+			}, f)
+			accent(chev, "TextColor3")
 			local l = New("TextLabel", {
-				BackgroundTransparency = 1, Size = UDim2.new(1, 0, 1, -4), Font = Enum.Font.GothamBold, TextSize = 11,
-				TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Bottom,
-				Text = titleText:upper(),
+				BackgroundTransparency = 1, Position = UDim2.fromOffset(18, 0), Size = UDim2.new(1, -18, 1, -4),
+				Font = Enum.Font.GothamBold, TextSize = 11, TextXAlignment = Enum.TextXAlignment.Left,
+				TextYAlignment = Enum.TextYAlignment.Bottom, Text = titleText:upper(),
 			}, f)
 			accent(l, "TextColor3")
-			New("Frame", {
+			local line = New("Frame", {
 				AnchorPoint = Vector2.new(0, 1), Position = UDim2.fromScale(0, 1), Size = UDim2.new(1, 0, 0, 1),
 				BackgroundColor3 = Theme.Stroke, BorderSizePixel = 0,
 			}, f)
+			New("UIGradient", { Transparency = NumberSequence.new(0, 1) }, line)
+			table.insert(td.Headers, f)
+			janitor:Add(f.Activated:Connect(function()
+				sec.Collapsed = not sec.Collapsed
+				chev.Text = if sec.Collapsed then "▸" else "▾"
+				applyFilter()
+			end))
 		end
 
 		function tab.Toggle(text: string, get: () -> boolean, set: (boolean) -> ())
-			local row = makeRow(32)
+			local row, hov = makeRow(34, text)
 			local btn = New("TextButton", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = "", AutoButtonColor = false }, row)
-			rowLabel(row, text, -70)
+			hov(btn)
+			rowLabel(row, text, -76)
 			local track = New("Frame", {
-				AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -10, 0.5, 0), Size = UDim2.fromOffset(38, 18),
+				AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -12, 0.5, 0), Size = UDim2.fromOffset(40, 20),
 				BackgroundColor3 = Theme.Off, BorderSizePixel = 0,
 			}, row)
 			New("UICorner", { CornerRadius = UDim.new(1, 0) }, track)
+			local glow = New("UIStroke", { Thickness = 2, Transparency = 1 }, track)
+			accent(glow, "Color")
 			local knob = New("Frame", {
-				AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 2, 0.5, 0), Size = UDim2.fromOffset(14, 14),
+				AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 3, 0.5, 0), Size = UDim2.fromOffset(14, 14),
 				BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0,
 			}, track)
 			New("UICorner", { CornerRadius = UDim.new(1, 0) }, knob)
@@ -666,15 +957,16 @@ local function createMenu(janitor: Janitor, onChange: () -> ()): any
 			register(function()
 				local on = get()
 				track.BackgroundColor3 = if on then Theme.Accent else Theme.Off
-				local target = if on then UDim2.new(0, 22, 0.5, 0) else UDim2.new(0, 2, 0.5, 0)
+				local target = if on then UDim2.new(0, 23, 0.5, 0) else UDim2.new(0, 3, 0.5, 0)
+				local glowT = if on then 0.55 else 1
 				if last == nil then
-					knob.Position = target
+					knob.Position, glow.Transparency = target, glowT
 				elseif last ~= on then
-					TweenService:Create(knob, tweenInfo, { Position = target }):Play()
+					tween(knob, TweenInfo.new(0.2, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Position = target })
+					tween(glow, med, { Transparency = glowT })
 				end
 				last = on
 			end)
-			hover(btn, row)
 			janitor:Add(btn.Activated:Connect(function()
 				set(not get())
 				onChange()
@@ -689,31 +981,49 @@ local function createMenu(janitor: Janitor, onChange: () -> ()): any
 			local fmt: (number) -> string = o.Format or function(v: number)
 				return tostring(math.floor(v * 100 + 0.5) / 100)
 			end
-			local row = makeRow(46)
-			rowLabel(row, text, -90).Position = UDim2.fromOffset(12, -6)
+			local row, hov = makeRow(50, text)
+			rowLabel(row, text, -100).Position = UDim2.fromOffset(14, -7)
 			local value = New("TextLabel", {
-				AnchorPoint = Vector2.new(1, 0), BackgroundTransparency = 1, Position = UDim2.new(1, -12, 0, 6),
+				AnchorPoint = Vector2.new(1, 0), BackgroundTransparency = 1, Position = UDim2.new(1, -14, 0, 8),
 				Size = UDim2.fromOffset(120, 16), Font = Enum.Font.GothamBold, TextSize = 12,
 				TextXAlignment = Enum.TextXAlignment.Right,
 			}, row)
 			accent(value, "TextColor3")
 			local track = New("Frame", {
-				Position = UDim2.new(0, 12, 1, -16), Size = UDim2.new(1, -24, 0, 6),
-				BackgroundColor3 = Theme.Off, BorderSizePixel = 0,
+				Position = UDim2.new(0, 14, 1, -17), Size = UDim2.new(1, -28, 0, 6),
+				BackgroundColor3 = if o.Rainbow then Color3.new(1, 1, 1) else Theme.Off, BorderSizePixel = 0,
 			}, row)
 			New("UICorner", { CornerRadius = UDim.new(1, 0) }, track)
-			local fill = New("Frame", { Size = UDim2.fromScale(0, 1), BorderSizePixel = 0 }, track)
+			local fill = New("Frame", { Size = UDim2.fromScale(0, 1), BorderSizePixel = 0, Visible = not o.Rainbow }, track)
 			accent(fill, "BackgroundColor3")
 			New("UICorner", { CornerRadius = UDim.new(1, 0) }, fill)
+			New("UIGradient", { Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromRGB(185, 185, 185)) }, fill)
+			if o.Rainbow then
+				local keys = {}
+				for i = 0, 6 do
+					table.insert(keys, ColorSequenceKeypoint.new(i / 6, Color3.fromHSV(i / 6, 0.85, 1)))
+				end
+				New("UIGradient", { Color = ColorSequence.new(keys) }, track)
+			end
 			local knob = New("Frame", {
 				AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0, 0.5), Size = UDim2.fromOffset(12, 12),
 				BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0, ZIndex = 2,
 			}, track)
 			New("UICorner", { CornerRadius = UDim.new(1, 0) }, knob)
+			local bubble = New("TextLabel", {
+				AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.new(0.5, 0, 0, -8), Size = UDim2.fromOffset(0, 20),
+				AutomaticSize = Enum.AutomaticSize.X, BackgroundColor3 = Theme.Bg, BorderSizePixel = 0,
+				Font = Enum.Font.GothamBold, TextSize = 11, TextColor3 = Theme.Text, Visible = false, ZIndex = 6, Text = "",
+			}, knob)
+			New("UICorner", { CornerRadius = UDim.new(0, 6) }, bubble)
+			New("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8) }, bubble)
+			local bubbleStroke = New("UIStroke", { Thickness = 1 }, bubble)
+			accent(bubbleStroke, "Color")
 			local hit = New("TextButton", {
-				Position = UDim2.new(0, 12, 1, -26), Size = UDim2.new(1, -24, 0, 26),
+				Position = UDim2.new(0, 14, 1, -28), Size = UDim2.new(1, -28, 0, 26),
 				BackgroundTransparency = 1, Text = "", AutoButtonColor = false, ZIndex = 3,
 			}, row)
+			hov(hit)
 
 			local function fromX(x: number)
 				local a = math.clamp((x - track.AbsolutePosition.X) / math.max(track.AbsoluteSize.X, 1), 0, 1)
@@ -727,8 +1037,14 @@ local function createMenu(janitor: Janitor, onChange: () -> ()): any
 			end
 			janitor:Add(hit.InputBegan:Connect(function(input)
 				if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+					bubble.Visible = true
+					tween(knob, fast, { Size = UDim2.fromOffset(16, 16) })
 					activeDrag = function(i)
 						fromX(i.Position.X)
+					end
+					activeEnd = function()
+						bubble.Visible = false
+						tween(knob, fast, { Size = UDim2.fromOffset(12, 12) })
 					end
 					fromX(input.Position.X)
 				end
@@ -739,19 +1055,22 @@ local function createMenu(janitor: Janitor, onChange: () -> ()): any
 				a = math.clamp(a, 0, 1)
 				fill.Size = UDim2.fromScale(a, 1)
 				knob.Position = UDim2.fromScale(a, 0.5)
-				value.Text = fmt(v)
+				local s = fmt(v)
+				value.Text = s
+				bubble.Text = s
 			end)
 		end
 
 		function tab.Cycle(text: string, options: { string }, get: () -> string, set: (string) -> ())
-			local row = makeRow(32)
-			rowLabel(row, text, -130)
-			local btn = small(row, "", UDim2.fromOffset(112, 22))
+			local row, hov = makeRow(34, text)
+			rowLabel(row, text, -150)
+			local btn = small(row, "", UDim2.fromOffset(124, 24))
 			btn.AnchorPoint = Vector2.new(1, 0.5)
 			btn.Position = UDim2.new(1, -10, 0.5, 0)
 			accent(btn, "TextColor3")
+			hov(btn)
 			register(function()
-				btn.Text = get()
+				btn.Text = "<  " .. get() .. "  >"
 			end)
 			janitor:Add(btn.Activated:Connect(function()
 				local idx = table.find(options, get()) or 0
@@ -762,17 +1081,19 @@ local function createMenu(janitor: Janitor, onChange: () -> ()): any
 		end
 
 		function tab.Swatches(text: string, get: () -> Color3, set: (Color3) -> ())
-			local row = makeRow(32)
-			rowLabel(row, text, -230)
+			local row, hov = makeRow(34, text)
+			rowLabel(row, text, -240)
 			local holder = New("Frame", {
-				AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -8, 0.5, 0), Size = UDim2.fromOffset(#Palette * 22, 20),
+				AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -10, 0.5, 0), Size = UDim2.fromOffset(#Palette * 22, 22),
 				BackgroundTransparency = 1,
 			}, row)
 			New("UIListLayout", {
 				FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder,
 				VerticalAlignment = Enum.VerticalAlignment.Center,
 			}, holder)
+			hov(holder)
 			local strokes = {} :: { UIStroke }
+			local swatches = {} :: { TextButton }
 			for i, color in Palette do
 				local sw = New("TextButton", {
 					Size = UDim2.fromOffset(18, 18), BackgroundColor3 = color, Text = "", AutoButtonColor = false,
@@ -780,6 +1101,14 @@ local function createMenu(janitor: Janitor, onChange: () -> ()): any
 				}, holder)
 				New("UICorner", { CornerRadius = UDim.new(1, 0) }, sw)
 				strokes[i] = New("UIStroke", { Color = Color3.new(1, 1, 1), Thickness = 2, Enabled = false }, sw)
+				swatches[i] = sw
+				hov(sw)
+				janitor:Add(sw.MouseEnter:Connect(function()
+					tween(sw, fast, { Size = UDim2.fromOffset(21, 21) })
+				end))
+				janitor:Add(sw.MouseLeave:Connect(function()
+					tween(sw, fast, { Size = UDim2.fromOffset(18, 18) })
+				end))
 				janitor:Add(sw.Activated:Connect(function()
 					set(color)
 					onChange()
@@ -795,11 +1124,12 @@ local function createMenu(janitor: Janitor, onChange: () -> ()): any
 		end
 
 		function tab.Keybind(text: string, get: () -> Enum.KeyCode, set: (Enum.KeyCode) -> ())
-			local row = makeRow(32)
-			rowLabel(row, text, -130)
-			local btn = small(row, "", UDim2.fromOffset(112, 22))
+			local row, hov = makeRow(34, text)
+			rowLabel(row, text, -150)
+			local btn = small(row, "", UDim2.fromOffset(124, 24))
 			btn.AnchorPoint = Vector2.new(1, 0.5)
 			btn.Position = UDim2.new(1, -10, 0.5, 0)
+			hov(btn)
 			register(function()
 				local l = listening
 				if l and l.Button == btn then
@@ -817,7 +1147,7 @@ local function createMenu(janitor: Janitor, onChange: () -> ()): any
 		end
 
 		function tab.Button(text: string, onClick: () -> (), danger: boolean?)
-			local row = makeRow(32)
+			local row, hov = makeRow(34, text)
 			local btn = New("TextButton", {
 				Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = text, Font = Enum.Font.GothamBold,
 				TextSize = 12, AutoButtonColor = false, TextColor3 = if danger then Config.EnemyColor else Theme.Text,
@@ -828,15 +1158,20 @@ local function createMenu(janitor: Janitor, onChange: () -> ()): any
 			else
 				accent(s, "Color")
 			end
-			hover(btn, row)
-			janitor:Add(btn.Activated:Connect(onClick))
+			hov(btn)
+			janitor:Add(btn.Activated:Connect(function()
+				-- click flash: snap to the accent colour, ease back
+				row.BackgroundColor3 = if danger then Config.EnemyColor else Theme.Accent
+				tween(row, med, { BackgroundColor3 = Theme.RowHover })
+				onClick()
+			end))
 		end
 
 		-- Multi-line text area. Returns the label so callers can stream text into it.
 		function tab.Info(height: number, getText: (() -> string)?): TextLabel
-			local row = makeRow(height)
+			local row = makeRow(height, "")
 			local l = New("TextLabel", {
-				BackgroundTransparency = 1, Position = UDim2.fromOffset(12, 6), Size = UDim2.new(1, -24, 1, -12),
+				BackgroundTransparency = 1, Position = UDim2.fromOffset(14, 6), Size = UDim2.new(1, -28, 1, -12),
 				Font = Enum.Font.Code, TextSize = 12, TextColor3 = Theme.Muted, TextWrapped = true,
 				TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top, Text = "",
 			}, row)
@@ -849,7 +1184,7 @@ local function createMenu(janitor: Janitor, onChange: () -> ()): any
 		end
 
 		function tab.Container(height: number): Frame
-			return makeRow(height)
+			return (makeRow(height, ""))
 		end
 
 		return tab
@@ -1977,7 +2312,7 @@ function HUDManager._buildMenu(self: any)
 	end
 
 	-- VISUALS ------------------------------------------------------------
-	local vis = menu.AddTab("Visuals")
+	local vis = menu.AddTab("Visuals", "◆")
 	vis.Section("Targets")
 	cfgToggle(vis, "HUD enabled", "Enabled")
 	cfgCycle(vis, "Mode", "Mode", { "All", "Teammates" })
@@ -2006,7 +2341,7 @@ function HUDManager._buildMenu(self: any)
 	cfgColor(vis, "Focus", "FocusColor")
 
 	-- OVERLAY ------------------------------------------------------------
-	local ov = menu.AddTab("Overlay")
+	local ov = menu.AddTab("Overlay", "◎")
 	ov.Section("Radar")
 	cfgToggle(ov, "Radar", "ShowRadar")
 	cfgSlider(ov, "Size", "RadarSize", 100, 320, { Step = 10, Format = px })
@@ -2026,7 +2361,7 @@ function HUDManager._buildMenu(self: any)
 	cfgSlider(ov, "Focus radius", "FocusRadius", 40, 600, { Step = 10, Format = px })
 
 	-- SPECTATE -----------------------------------------------------------
-	local sp = menu.AddTab("Spectate")
+	local sp = menu.AddTab("Spectate", "▶")
 	sp.Section("Target")
 	sp.Info(30, function()
 		local p = self._specPlayer
@@ -2107,7 +2442,7 @@ function HUDManager._buildMenu(self: any)
 	end)
 
 	-- MISC ---------------------------------------------------------------
-	local misc = menu.AddTab("Misc")
+	local misc = menu.AddTab("Misc", "■")
 	misc.Section("Performance")
 	cfgSlider(misc, "Max active tags", "MaxActiveTags", 1, Config.PoolSize, { Step = 1 })
 	cfgSlider(misc, "Fade time", "FadeTime", 0.05, 1, { Step = 0.05, Format = function(v: number)
@@ -2131,7 +2466,7 @@ function HUDManager._buildMenu(self: any)
 	end)
 
 	-- SETTINGS -----------------------------------------------------------
-	local set = menu.AddTab("Settings")
+	local set = menu.AddTab("Settings", "●")
 	set.Section("Presets")
 	local presetIndex = 1
 	local names = {} :: { string }
@@ -2158,6 +2493,16 @@ function HUDManager._buildMenu(self: any)
 		Config.Accent = c
 		menu.SetAccent(c)
 	end)
+	set.Slider("Accent hue", 0, 1, function()
+		local h = Config.Accent:ToHSV()
+		return h
+	end, function(h: number)
+		Config.Accent = Color3.fromHSV(h, 0.85, 1)
+		menu.SetAccent(Config.Accent)
+	end, { Rainbow = true, Step = 0.005, Format = function(h: number)
+		return ("%d°"):format(math.floor(h * 360 + 0.5))
+	end })
+	cfgToggle(set, "Animated border", "AnimatedBorder")
 	cfgSlider(set, "Menu scale", "MenuScale", 0.7, 1.4, { Step = 0.05, Format = function(v: number)
 		return ("%d%%"):format(math.floor(v * 100 + 0.5))
 	end })

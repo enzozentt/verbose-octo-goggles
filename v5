@@ -1,6 +1,6 @@
 --!strict
 --[[
-	TacticalHUD v9 — spectator / teammate / debug overlay with a tabbed menu.
+	TacticalHUD v10 — spectator / teammate / debug overlay with a tabbed menu.
 
 	Place as a LocalScript in StarterPlayer > StarterPlayerScripts.
 
@@ -84,6 +84,7 @@ local Config = {
 	ShowNames = true,
 	ShowHealth = true,
 	ShowDistance = true,
+	ChamsMax = 28, -- Roblox renders at most ~31 Highlights; the nearest ChamsMax targets get them
 	ShowChams = false, -- NOTE: Roblox renders at most 31 Highlights at once
 	ChamsFillTransparency = 0.65,
 	ShowArrows = true,
@@ -516,11 +517,29 @@ function Pool.Release<T>(self: any, item: T)
 	if self._inPool[item] ~= false then
 		return -- unknown item or double release
 	end
-	self._onRelease(item)
+	-- A failing reset must never strand the item "in use" forever (that slowly starves
+	-- the pool): log it and return the item anyway.
+	local ok, err = pcall(self._onRelease, item)
+	if not ok and not self._warned then
+		self._warned = true
+		warn("[TacticalHUD] pool reset error (item recycled anyway): " .. tostring(err))
+	end
 	self._inPool[item] = true
 	local n: number = self._freeCount + 1
 	self._free[n] = item
 	self._freeCount = n
+end
+
+-- Leak recovery: anything marked in-use that nothing actually holds goes back to the pool.
+function Pool.Reclaim(self: any, held: { [any]: boolean }): number
+	local reclaimed = 0
+	for _, item in self._all do
+		if self._inPool[item] == false and not held[item] then
+			Pool.Release(self, item)
+			reclaimed += 1
+		end
+	end
+	return reclaimed
 end
 
 function Pool.FreeCount(self: any): number
@@ -1827,8 +1846,11 @@ type Record = {
 	BadReads: number, -- consecutive invalid health reads (3 = re-detect the source)
 	ObservedMax: number, -- highest health seen; max-health fallback for sources without one
 	Verify: (() -> string?)?, -- health watchdog, called on each rescan
-	BoneParts: { BasePart }, -- unique parts used by the skeleton
+	BoneParts: { Instance }, -- unique joint points used by the skeleton (BaseParts or Attachments/Bones)
+	BoneAtt: { boolean }, -- parallel to BoneParts: true = Attachment (use WorldPosition)
 	BoneIdx: { number }, -- pairs of indices into BoneParts
+	LastDist: number, -- last on-screen distance (chams ranking)
+	ChamWant: boolean,
 	Skel: any, -- pooled skeleton item while one is shown
 	SkelColor: Color3?,
 	SkelTr: number,
@@ -1845,7 +1867,7 @@ type Record = {
 local HUDManager = {}
 HUDManager.__index = HUDManager
 
-local function createTag(tagParent: Instance, overlay: Instance): Tag
+local function createTag(tagParent: Instance, overlay: Instance, chamParent: Instance): Tag
 	local gui = New("BillboardGui", {
 		Name = "Tag", Size = Config.TagSize, StudsOffset = Config.TagStudsOffset,
 		-- Bottom edge sits on the anchor so the tag stays above the box at any range.
@@ -1926,7 +1948,7 @@ local function createTag(tagParent: Instance, overlay: Instance): Tag
 	local chams = New("Highlight", {
 		Name = "Chams", DepthMode = Enum.HighlightDepthMode.AlwaysOnTop, FillTransparency = 1,
 		OutlineTransparency = 1, Enabled = false,
-	}, tagParent)
+	}, chamParent) -- a client-only folder in Workspace: Highlights render reliably from there
 
 	return {
 		Gui = gui, Group = group, Name = nameLabel, Info = info, BarBack = back, Ghost = ghost, Fill = fill,
@@ -1989,50 +2011,12 @@ function HUDManager.new()
 	self._cfgVersion = 0
 	self._focusRec = nil :: Record?
 
-	local playerGui = localPlayer:WaitForChild("PlayerGui")
-	self._folder = New("Folder", { Name = "TacticalHUD_Tags" }, playerGui)
-	-- IgnoreGuiInset so overlay pixels match WorldToViewportPoint output.
-	self._overlay = New("ScreenGui", {
-		Name = "TacticalHUD_Overlay", ResetOnSpawn = false, IgnoreGuiInset = true, DisplayOrder = 5,
-		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
-	}, playerGui)
-	self._static = New("ScreenGui", {
-		Name = "TacticalHUD_Static", ResetOnSpawn = false, IgnoreGuiInset = true, DisplayOrder = 4,
-		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
-	}, playerGui)
-
-	self._pool = Pool.new(Config.PoolSize, function()
-		return createTag(self._folder, self._overlay)
-	end, resetTag, destroyTag)
-	self._arrowPool = Pool.new(Config.ArrowPoolSize, function()
-		return createArrow(self._overlay)
-	end, function(a: TextLabel)
-		a.Visible = false
-	end, function(a: TextLabel)
-		a:Destroy()
-	end)
-
-	-- Skeletons: 24 reusable line Frames per item. Joint projections go into
-	-- preallocated arrays, so drawing a skeleton allocates nothing.
-	self._skelPool = Pool.new(Config.SkeletonPoolSize, function()
-		local lines: { Frame } = {}
-		for i = 1, 24 do
-			lines[i] = New("Frame", {
-				AnchorPoint = Vector2.new(0.5, 0.5), BorderSizePixel = 0, BackgroundTransparency = 1, Visible = false,
-			}, self._overlay)
-		end
-		return { Lines = lines, Used = 0 }
-	end, function(item: any)
-		for _, l in item.Lines do
-			l.Visible = false
-		end
-		item.Used = 0
-	end, function(item: any)
-		for _, l in item.Lines do
-			l:Destroy()
-		end
-	end)
+	self._healCount, self._reclaimed, self._errCount, self._healToken = 0, 0, 0, 0
+	self._chamList = {} :: { Record }
+	self._chamTimer, self._chamsDirty = 0, true
 	self._projX, self._projY, self._projOk = table.create(40, 0), table.create(40, 0), table.create(40, false)
+	self._pRight, self._pUp, self._pLook, self._pPos = Vector3.xAxis, Vector3.yAxis, -Vector3.zAxis, Vector3.zero
+	self:_createVisuals()
 
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Exclude
@@ -2062,6 +2046,209 @@ function HUDManager.new()
 	self._assistLastRec = nil :: Record?
 	self._los, self._losTimer = true, 0
 	return self
+end
+
+-- Builds every GUI container and object pool. Called once at startup and again by
+-- _rebuildVisuals when a round change (or anything else) destroys part of the HUD.
+function HUDManager._createVisuals(self: any)
+	local playerGui = localPlayer:WaitForChild("PlayerGui")
+	self._playerGui = playerGui
+	self._folder = New("Folder", { Name = "TacticalHUD_Tags" }, playerGui)
+	self._chamFolder = New("Folder", { Name = "TacticalHUD_Chams" }, Workspace)
+	self._overlay = New("ScreenGui", {
+		Name = "TacticalHUD_Overlay", ResetOnSpawn = false, IgnoreGuiInset = true, DisplayOrder = 5,
+		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+	}, playerGui)
+	self._static = New("ScreenGui", {
+		Name = "TacticalHUD_Static", ResetOnSpawn = false, IgnoreGuiInset = true, DisplayOrder = 4,
+		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+	}, playerGui)
+	-- If anything pulls a container out of the world, heal shortly after.
+	for _, inst in { self._folder, self._chamFolder, self._overlay, self._static } do
+		inst.AncestryChanged:Connect(function()
+			if not inst.Parent then
+				self:_scheduleHeal(0.2)
+			end
+		end)
+	end
+
+	local folder, overlay, chamFolder = self._folder, self._overlay, self._chamFolder
+	self._pool = Pool.new(Config.PoolSize, function()
+		return createTag(folder, overlay, chamFolder)
+	end, resetTag, destroyTag)
+	self._arrowPool = Pool.new(Config.ArrowPoolSize, function()
+		return createArrow(overlay)
+	end, function(a: TextLabel)
+		a.Visible = false
+	end, function(a: TextLabel)
+		a:Destroy()
+	end)
+
+	-- Skeletons: 24 reusable line Frames per item. Joint projections go into
+	-- preallocated arrays, so drawing a skeleton allocates nothing.
+	self._skelPool = Pool.new(Config.SkeletonPoolSize, function()
+		local lines: { Frame } = {}
+		for i = 1, 24 do
+			lines[i] = New("Frame", {
+				AnchorPoint = Vector2.new(0.5, 0.5), BorderSizePixel = 0, BackgroundTransparency = 1, Visible = false,
+			}, overlay)
+		end
+		return { Lines = lines, Used = 0 }
+	end, function(item: any)
+		for _, l in item.Lines do
+			l.Visible = false
+		end
+		item.Used = 0
+	end, function(item: any)
+		for _, l in item.Lines do
+			l:Destroy()
+		end
+	end)
+end
+
+function HUDManager._scheduleHeal(self: any, delay: number)
+	if self._destroyed then
+		return
+	end
+	self._healToken += 1
+	local token = self._healToken
+	task.delay(delay, function()
+		if token == self._healToken and not self._destroyed then
+			self:_heal()
+		end
+	end)
+end
+
+-- Throws away the pooled visuals and rebuilds them. Targets keep their bindings and
+-- simply re-acquire fresh tags on the next frame.
+function HUDManager._rebuildVisuals(self: any)
+	self._healCount += 1
+	for _, rec in self._list do
+		rec.Tag, rec.Arrow, rec.Skel, rec.ArrowAccent, rec.SkelColor = nil, nil, nil, nil, nil
+		rec.Alpha, rec.AppliedAlpha, rec.Tier, rec.AppliedCfg, rec.SkelTr = 0, 0, -1, -1, -1
+	end
+	for _, inst in { self._folder, self._chamFolder, self._overlay, self._static } do
+		pcall(function()
+			inst:Destroy()
+		end)
+	end
+	self:_createVisuals()
+	self:_buildStatic()
+	self:_applyStatic()
+	self._chamsDirty = true
+end
+
+-- Runs every second (and on camera swaps / respawns / container loss): verifies the HUD is
+-- intact, recovers leaked pool items, and rebuilds everything if any piece was destroyed.
+function HUDManager._heal(self: any)
+	local playerGui = localPlayer:FindFirstChild("PlayerGui")
+	if not playerGui then
+		return
+	end
+	local broken = playerGui ~= self._playerGui
+	if not broken then
+		for _, inst in { self._folder, self._overlay, self._static } do
+			if inst.Parent ~= playerGui then
+				-- can it be put back? (a destroyed instance refuses to be re-parented)
+				local ok = pcall(function()
+					inst.Parent = playerGui
+				end)
+				if not ok or inst.Parent ~= playerGui then
+					broken = true
+				end
+			end
+		end
+		if self._chamFolder.Parent ~= Workspace then
+			local ok = pcall(function()
+				self._chamFolder.Parent = Workspace
+			end)
+			if not ok or self._chamFolder.Parent ~= Workspace then
+				broken = true
+			end
+		end
+		self._overlay.Enabled = true
+		self._static.Enabled = true
+		-- pooled objects that were individually destroyed (e.g. a cleanup that wipes
+		-- every Highlight in Workspace, or every Frame it finds)
+		if not broken then
+			for _, tag in self._pool._all do
+				if not (tag.Gui.Parent and tag.Group.Parent and tag.Box.Parent and tag.Tracer.Parent and tag.Chams.Parent) then
+					broken = true
+					break
+				end
+			end
+		end
+		if not broken then
+			for _, a in self._arrowPool._all do
+				if not a.Parent then
+					broken = true
+					break
+				end
+			end
+		end
+		if not broken then
+			for _, item in self._skelPool._all do
+				if not item.Lines[1].Parent then
+					broken = true
+					break
+				end
+			end
+		end
+	end
+	if broken then
+		self:_rebuildVisuals()
+		return
+	end
+
+	-- leak recovery
+	local heldTags, heldArrows, heldSkels = {}, {}, {}
+	for _, rec in self._list do
+		if rec.Tag then
+			heldTags[rec.Tag] = true
+		end
+		if rec.Arrow then
+			heldArrows[rec.Arrow] = true
+		end
+		if rec.Skel then
+			heldSkels[rec.Skel] = true
+		end
+	end
+	self._reclaimed += self._pool:Reclaim(heldTags) + self._arrowPool:Reclaim(heldArrows) + self._skelPool:Reclaim(heldSkels)
+end
+
+-- Logs a render-loop error once and schedules a heal, instead of letting it silently
+-- kill the visuals every frame.
+function HUDManager._reportError(self: any, where: string, err: any)
+	self._errCount += 1
+	if self._errCount <= 3 then
+		warn(("[TacticalHUD] error in %s (visuals self-heal; paste this if it keeps happening): %s"):format(where, tostring(err)))
+	end
+	self:_scheduleHeal(0.3)
+end
+
+-- Highlights: Roblox only renders ~31 at once, so enable the nearest ChamsMax and switch
+-- the rest off, instead of letting the engine pick arbitrarily.
+function HUDManager._updateChams(self: any)
+	local list = self._chamList
+	table.clear(list)
+	for _, rec in self._list do
+		rec.ChamWant = false
+		if Config.ShowChams and rec.Tag and rec.Tier >= 0 and rec.Tier <= 1 then
+			table.insert(list, rec)
+		end
+	end
+	table.sort(list, function(a: Record, b: Record)
+		return a.LastDist < b.LastDist
+	end)
+	for i = 1, math.min(#list, Config.ChamsMax) do
+		list[i].ChamWant = true
+	end
+	for _, rec in self._list do
+		local tag = rec.Tag
+		if tag and tag.Chams.Enabled ~= rec.ChamWant then
+			tag.Chams.Enabled = rec.ChamWant
+		end
+	end
 end
 
 function HUDManager._invalidate(self: any)
@@ -2155,6 +2342,7 @@ function HUDManager._unbindCharacter(self: any, rec: Record)
 	rec.Pending, rec.Refresh, rec.Polled = nil, nil, false
 	rec.Verify, rec.HeadPart, rec.HasHealth = nil, nil, false
 	table.clear(rec.BoneParts)
+	table.clear(rec.BoneAtt)
 	table.clear(rec.BoneIdx)
 	rec.Alive = false
 	rec.Occluded = false
@@ -2242,46 +2430,124 @@ function HUDManager._collectBones(self: any, rec: Record)
 	if not (ch and root) then
 		return
 	end
-	local parts, idx = rec.BoneParts, rec.BoneIdx
+	local parts, atts, idx = rec.BoneParts, rec.BoneAtt, rec.BoneIdx
 	table.clear(parts)
+	table.clear(atts)
 	table.clear(idx)
-	local map: { [BasePart]: number } = {}
-	local function pid(p: BasePart): number
-		local i = map[p]
+	local MAX_BONES = 24
+	local map: { [Instance]: number } = {}
+	local seen: { [number]: boolean } = {}
+
+	-- A "point" is a BasePart (its Position) or an Attachment/Bone (its WorldPosition).
+	local function owner(o: Instance): BasePart?
+		if o:IsA("BasePart") then
+			return o
+		elseif o:IsA("Attachment") then
+			local p = o.Parent
+			return if p and p:IsA("BasePart") then p else nil
+		end
+		return nil
+	end
+	local function usable(o: Instance?): boolean
+		if not o then
+			return false
+		end
+		local p = owner(o)
+		if not p or not p:IsDescendantOf(ch) then
+			return false
+		end
+		-- accessories, tools and held items are not part of the skeleton
+		return p.Name ~= "Handle" and p:FindFirstAncestorWhichIsA("Accessory") == nil and p:FindFirstAncestorWhichIsA("Tool") == nil
+	end
+	local function pid(o: Instance): number
+		local i = map[o]
 		if not i then
-			table.insert(parts, p)
+			table.insert(parts, o)
+			table.insert(atts, o:IsA("Attachment"))
 			i = #parts
-			map[p] = i
+			map[o] = i
 		end
 		return i
 	end
-	local function skip(p: BasePart): boolean
-		return p.Name == "Handle" or p:FindFirstAncestorWhichIsA("Accessory") ~= nil or p:FindFirstAncestorWhichIsA("Tool") ~= nil
+	local function addBone(a: Instance?, b: Instance?)
+		if #idx >= MAX_BONES * 2 or a == b or not usable(a) or not usable(b) then
+			return
+		end
+		local ia, ib = pid(a :: Instance), pid(b :: Instance)
+		local key = math.min(ia, ib) * 1000 + math.max(ia, ib)
+		if seen[key] then
+			return
+		end
+		seen[key] = true
+		table.insert(idx, ia)
+		table.insert(idx, ib)
 	end
+
+	-- 1. Real joints: Motor6D, constraints with attachments (AnimationConstraint, ball/hinge
+	--    sockets used by ragdolls...), and Bone hierarchies on skinned meshes.
 	for _, d in ch:GetDescendants() do
 		if d:IsA("Motor6D") then
-			local a, b = d.Part0, d.Part1
-			if a and b and a:IsDescendantOf(ch) and b:IsDescendantOf(ch) and not skip(a) and not skip(b) then
-				table.insert(idx, pid(a))
-				table.insert(idx, pid(b))
-				if #idx >= 48 then
-					break
-				end
+			addBone(d.Part0, d.Part1)
+		elseif d:IsA("Constraint") then
+			addBone(d.Attachment0, d.Attachment1)
+		elseif d:IsA("Bone") then
+			local p = d.Parent
+			if p and p:IsA("Bone") then
+				addBone(p, d)
 			end
 		end
 	end
-	if #idx == 0 then
-		local ri = pid(root)
-		local n = 0
-		for _, c in ch:GetChildren() do
-			if c:IsA("BasePart") and c ~= root and not skip(c) then
-				table.insert(idx, ri)
-				table.insert(idx, pid(c))
-				n += 1
-				if n >= 10 then
-					break
+	-- 2. Welded rigs: only if the joints above gave too little to draw.
+	if #idx < 8 then
+		for _, d in ch:GetDescendants() do
+			if d:IsA("Weld") or d:IsA("ManualWeld") or d:IsA("WeldConstraint") then
+				addBone(d.Part0, d.Part1)
+			end
+		end
+	end
+	-- 3. Universal fallback for ANY rig: a minimum spanning tree over the body's largest
+	--    parts, grown from the root. No joint type or naming needed.
+	if #idx < 8 then
+		table.clear(parts)
+		table.clear(atts)
+		table.clear(idx)
+		table.clear(map)
+		table.clear(seen)
+		local cand: { BasePart } = {}
+		local rp = root.Position
+		for _, d in ch:GetDescendants() do
+			if d:IsA("BasePart") and d ~= root and usable(d) and (d.Position - rp).Magnitude <= 12 then
+				table.insert(cand, d)
+			end
+		end
+		table.sort(cand, function(a: BasePart, b: BasePart)
+			local sa, sb = a.Size, b.Size
+			return sa.X * sa.Y * sa.Z > sb.X * sb.Y * sb.Z
+		end)
+		local nodes: { BasePart } = { root }
+		for i = 1, math.min(#cand, 13) do
+			table.insert(nodes, cand[i])
+		end
+		local inTree: { [number]: boolean } = { [1] = true }
+		for _ = 2, #nodes do
+			local bestA, bestB, bestD = 0, 0, math.huge
+			for i = 1, #nodes do
+				if inTree[i] then
+					for j = 1, #nodes do
+						if not inTree[j] then
+							local dd = (nodes[i].Position - nodes[j].Position).Magnitude
+							if dd < bestD then
+								bestA, bestB, bestD = i, j, dd
+							end
+						end
+					end
 				end
 			end
+			if bestB == 0 then
+				break
+			end
+			inTree[bestB] = true
+			addBone(nodes[bestA], nodes[bestB])
 		end
 	end
 end
@@ -2314,11 +2580,20 @@ function HUDManager._drawSkeleton(self: any, rec: Record, color: Color3)
 		rec.SkelColor, rec.SkelTr = nil, -1
 	end
 	local xs, ys, ok = self._projX, self._projY, self._projOk
+	local atts = rec.BoneAtt
+	local camPos, right, up, look = self._pPos, self._pRight, self._pUp, self._pLook
+	local cx, cy, k = self._cx, self._cy, self._k
 	for i = 1, #parts do
 		local p = parts[i]
 		if p.Parent then
-			local vp = camera:WorldToViewportPoint(p.Position)
-			xs[i], ys[i], ok[i] = vp.X, vp.Y, vp.Z > 0
+			-- same manual projection as the main loop (works regardless of Camera.ViewportSize)
+			local d = (if atts[i] then (p :: Attachment).WorldPosition else (p :: BasePart).Position) - camPos
+			local z = d:Dot(look)
+			if z > 0.1 then
+				xs[i], ys[i], ok[i] = cx + d:Dot(right) / z * k, cy - d:Dot(up) / z * k, true
+			else
+				ok[i] = false
+			end
 		else
 			ok[i] = false
 		end
@@ -2462,6 +2737,11 @@ function HUDManager._rescan(self: any, rec: Record, now: number)
 	elseif not resolved and cur then
 		self:_unbindCharacter(rec)
 	elseif cur then
+		-- the rig's parts were replaced inside the same model (round reset): re-bind
+		if rec.Root and not rec.Root:IsDescendantOf(cur) then
+			self:_bindCharacter(rec, cur)
+			return
+		end
 		-- the real root may have replicated after we bound a fallback: re-bind once
 		local better = Utils.ResolveRoot(cur, false)
 		if better and better ~= rec.Root then
@@ -2751,7 +3031,8 @@ function HUDManager._addPlayer(self: any, player: any)
 		BoxW = Config.BoxWidthStuds, BoxH = Config.BoxHeightStuds, CenterY = 0,
 		TagOffset = Config.TagStudsOffset, RigInfo = "not bound yet",
 		HealthSourceName = "none yet", HeadPart = nil, HeadOffset = 1.6, HasHealth = false, BadReads = 0, ObservedMax = 0, Verify = nil,
-		BoneParts = {}, BoneIdx = {}, Skel = nil, SkelColor = nil, SkelTr = -1,
+		BoneParts = {}, BoneAtt = {}, BoneIdx = {}, LastDist = 1e9, ChamWant = false,
+		Skel = nil, SkelColor = nil, SkelTr = -1,
 		CharJanitor = Utils.NewJanitor(), PlayerJanitor = Utils.NewJanitor(),
 	}
 	self._records[key] = rec
@@ -2989,11 +3270,17 @@ function HUDManager._restyle(self: any, rec: Record, tag: Tag, tier: number, foc
 	chams.FillColor, chams.OutlineColor = color, color
 	chams.FillTransparency = 1 - rec.Alpha * (1 - Config.ChamsFillTransparency)
 	chams.OutlineTransparency = 1 - rec.Alpha
-	chams.Enabled = Config.ShowChams and tier <= 1
+	-- On/off is decided by _updateChams (nearest ChamsMax get it): just make sure it can
+	-- turn off immediately, and ask for a re-rank now that this target changed.
+	if not Config.ShowChams then
+		chams.Enabled = false
+	end
+	self._chamsDirty = true
 end
 
 -- Positions the screen-space pieces for one visible target.
 function HUDManager._layout(self: any, rec: Record, tag: Tag, vx: number, vy: number, depth: number, dist: number)
+	rec.LastDist = dist
 	local tier = if dist <= Config.NearDetailDistance then 0 elseif dist <= Config.MidDetailDistance then 1 else 2
 	local focused = rec == self._focusRec
 	local accent = self:_accentFor(rec.Player)
@@ -3296,9 +3583,21 @@ function HUDManager.Update(self: any, dt: number)
 	-- actually rendered this frame (otherwise boxes would lag the assist).
 	self:_applyAssist(camera, dt)
 
+	-- Viewport: the overlay's AbsoluteSize is the real screen size and can't go stale.
+	-- Camera.ViewportSize can be wrong for a while after a game swaps cameras (round
+	-- changes), and Camera:WorldToViewportPoint would be wrong with it, which is why
+	-- projection below is done by hand from the camera's CFrame and FOV instead.
+	local vsz = self._overlay.AbsoluteSize
+	if vsz.X < 50 or vsz.Y < 50 then
+		vsz = camera.ViewportSize
+	end
+	local vw, vh = math.max(vsz.X, 2), math.max(vsz.Y, 2)
+	self._cx, self._cy, self._vh = vw * 0.5, vh * 0.5, vh
 	local camCF = camera.CFrame
 	local camPos = camCF.Position
-	local cx, cy = self._cx, self._cy
+	local camRight, camUp, camLook = camCF.RightVector, camCF.UpVector, camCF.LookVector
+	self._pRight, self._pUp, self._pLook, self._pPos = camRight, camUp, camLook, camPos
+	local cx, cy = vw * 0.5, vh * 0.5
 	local maxDist = Config.MaxRenderDistance
 	local maxDistSq = maxDist * maxDist
 	local radius = Config.ScreenRadius
@@ -3316,7 +3615,16 @@ function HUDManager.Update(self: any, dt: number)
 	local maxTags = math.min(Config.MaxActiveTags, pool:Capacity())
 	local activeCount = pool:Capacity() - pool:FreeCount()
 
-	self._k = self._vh / (2 * math.tan(math.rad(camera.FieldOfView) * 0.5))
+	-- pixels per (stud / depth): vertical FOV drives it; other FOV modes are converted
+	local tanHalf = math.tan(math.rad(math.clamp(camera.FieldOfView, 1, 120)) * 0.5)
+	local fovMode = camera.FieldOfViewMode
+	if fovMode == Enum.FieldOfViewMode.Diagonal then
+		tanHalf = tanHalf * vh / math.sqrt(vw * vw + vh * vh)
+	elseif fovMode == Enum.FieldOfViewMode.MaxAxis then
+		tanHalf = tanHalf * vh / math.max(vw, vh)
+	end
+	local k = vh / (2 * tanHalf)
+	self._k = k
 	local origin = Config.TracerOrigin
 	self._tracerY = if origin == "Bottom" then self._vh elseif origin == "Center" then cy else 0
 
@@ -3345,6 +3653,12 @@ function HUDManager.Update(self: any, dt: number)
 		local vx, vy, depth, dist = 0, 0, 1, 0
 		local root = rec.Root
 		local arrowPos = Vector3.zero
+		if root and not root.Parent then
+			-- the rig's parts were swapped/destroyed (round reset): never draw from a stale
+			-- position, and have the rescan re-bind this target as soon as it can
+			rec.NextScan = 0
+			root = nil
+		end
 		if root then
 			nBound += 1
 		end
@@ -3358,10 +3672,18 @@ function HUDManager.Update(self: any, dt: number)
 				local dSq = d:Dot(d)
 				if dSq <= maxDistSq then -- distance cull
 					nRange += 1
-					local vp, onScreen = camera:WorldToViewportPoint(pos)
+					-- manual perspective projection (see the viewport note above)
+					local depthZ = d:Dot(camLook)
+					local pxv, pyv = 0, 0
+					local onScreen = false
+					if depthZ > 0.1 then
+						pxv = cx + d:Dot(camRight) / depthZ * k
+						pyv = cy - d:Dot(camUp) / depthZ * k
+						onScreen = pxv >= 0 and pxv <= vw and pyv >= 0 and pyv <= vh
+					end
 					if onScreen then -- frustum cull
 						nScreen += 1
-						local dx, dy = vp.X - cx, vp.Y - cy
+						local dx, dy = pxv - cx, pyv - cy
 						local cdSq = dx * dx + dy * dy
 						if cdSq <= radiusSq then -- FOV radius cull
 							nRadius += 1
@@ -3371,7 +3693,7 @@ function HUDManager.Update(self: any, dt: number)
 							end
 							if want then
 								nVisible += 1
-								vx, vy, depth = vp.X, vp.Y, math.max(vp.Z, 0.1)
+								vx, vy, depth = pxv, pyv, depthZ
 								dist = math.sqrt(dSq)
 								if cdSq < bestSq then
 									bestSq, bestRec = cdSq, rec
@@ -3446,7 +3768,10 @@ function HUDManager.Update(self: any, dt: number)
 					stolen = acquired ~= nil
 				end
 				if acquired then
-					self:_bindTag(rec, acquired)
+					local okBind, errBind = pcall(self._bindTag, self, rec, acquired)
+					if not okBind then
+						self:_reportError("bindTag", errBind)
+					end
 					if not stolen then
 						activeCount += 1
 					end
@@ -3492,7 +3817,10 @@ function HUDManager.Update(self: any, dt: number)
 			end
 
 			if want then
-				self:_layout(rec, tag, vx, vy, depth, dist)
+				local okLayout, errLayout = pcall(self._layout, self, rec, tag, vx, vy, depth, dist)
+				if not okLayout then
+					self:_reportError("layout", errLayout)
+				end
 			end
 		else
 			rec.GhostFrac = rec.HealthFrac -- nothing visible to animate
@@ -3534,11 +3862,21 @@ function HUDManager.Update(self: any, dt: number)
 	if self._localTimer >= 1 then
 		self._localTimer = 0
 		self:_refreshTeams() -- deep team re-check, every second
+		local okHeal, errHeal = pcall(self._heal, self) -- integrity check + leak recovery
+		if not okHeal then
+			self:_reportError("heal", errHeal)
+		end
 		local lc = self:_resolveCharacter(localPlayer)
 		if lc ~= self._lastLocal then
 			self._lastLocal = lc
 			self._rayParams.FilterDescendantsInstances = if lc then { lc } else {}
 		end
+	end
+
+	self._chamTimer += dt
+	if self._chamsDirty or self._chamTimer >= 0.25 then
+		self._chamTimer, self._chamsDirty = 0, false
+		self:_updateChams()
 	end
 
 	self._fpsFrames += 1
@@ -3562,9 +3900,9 @@ function HUDManager.Update(self: any, dt: number)
 		if dbg and self._menu.Gui.Enabled then
 			local fr = self._focusRec :: Record?
 			dbg.Text = string.format(
-				"tracked   %d\npass mode %d\nin range  %d\non screen %d\nin radius %d\nvisible   %d\narrows    %d\npool free %d/%d\n\nfocus rig: %s",
+				"tracked   %d\npass mode %d\nin range  %d\non screen %d\nin radius %d\nvisible   %d\narrows    %d\npool free %d/%d\nrebuilds  %d  reclaimed %d  errors %d\n\nfocus rig: %s",
 				stats.Total, stats.Mode, stats.Range, stats.Screen, stats.Radius, stats.Visible, stats.Arrows,
-				pool:FreeCount(), pool:Capacity(),
+				pool:FreeCount(), pool:Capacity(), self._healCount, self._reclaimed, self._errCount,
 				if fr then ("%s  team=%s (you: %s)"):format(fr.RigInfo, tostring(self._teamIds[fr.Player]), tostring(self._localTeamId)) else "(aim near a target)"
 			)
 		end
@@ -3907,6 +4245,7 @@ function HUDManager._buildMenu(self: any)
 	cfgToggle(vis, "Distance", "ShowDistance")
 	cfgToggle(vis, "Chams (highlight)", "ShowChams")
 	cfgSlider(vis, "Chams fill transparency", "ChamsFillTransparency", 0, 1, { Step = 0.05 })
+	cfgSlider(vis, "Chams limit (nearest)", "ChamsMax", 1, 31, { Step = 1 })
 	cfgToggle(vis, "Off-screen arrows", "ShowArrows")
 	vis.Section("Culling & detail")
 	cfgSlider(vis, "Max range", "MaxRenderDistance", Config.MinRenderDistance, Config.MaxRenderDistanceCap, { Log = true, Step = 10, Format = studs })
@@ -4079,6 +4418,10 @@ function HUDManager._buildMenu(self: any)
 	misc.Button("Rescan all targets now", function()
 		self:_rescanAll()
 		menu.Toast("Rescanning...")
+	end)
+	misc.Button("Rebuild visuals now", function()
+		self:_rebuildVisuals()
+		menu.Toast("Visuals rebuilt")
 	end)
 	misc.Button("Health self-test (print to output)", function()
 		self:PrintHealthProbe()
@@ -4415,6 +4758,13 @@ function HUDManager.Start(self: any)
 	end
 	onLocalChar(localPlayer.Character)
 	j:Add(localPlayer.CharacterAdded:Connect(onLocalChar))
+	-- Round changes usually respawn us and/or swap the camera: re-verify the HUD right after.
+	j:Add(localPlayer.CharacterAdded:Connect(function()
+		self:_scheduleHeal(1)
+	end))
+	j:Add(Workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+		self:_scheduleHeal(0.5)
+	end))
 
 	-- Know our own team before any target can be drawn; react to our own team changes.
 	self:_refreshTeams()
@@ -4515,6 +4865,7 @@ function HUDManager.Destroy(self: any)
 	self._pool:Destroy()
 	self._arrowPool:Destroy()
 	self._skelPool:Destroy()
+	self._chamFolder:Destroy()
 	self._folder:Destroy()
 	self._overlay:Destroy()
 	self._static:Destroy()

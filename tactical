@@ -1,0 +1,2300 @@
+--!strict
+--[[
+	TacticalHUD v3 — spectator / teammate / debug overlay with a tabbed menu.
+
+	Place as a LocalScript in StarterPlayer > StarterPlayerScripts.
+
+	World overlay : corner-bracket boxes, tracers, chams (Highlight), name tags with
+	                ghost health bars, off-screen arrows, LOD tiers, crosshair focus
+	Screen overlay: radar, crosshair, focus ring, focus info card, watermark (FPS/ping)
+	Spectate      : player list, next/prev, spectate-focused, freecam
+	Menu          : draggable, tabbed, sliders, switches, keybinds, themes, presets
+
+	Sections: Config -> Utils -> Pool -> UI -> HUDManager -> MainLoop
+
+	NOTE: with Workspace.StreamingEnabled on, far characters are not replicated to
+	the client, so no script can draw them. For long range, turn streaming off or
+	raise StreamingTargetRadius.
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local Workspace = game:GetService("Workspace")
+local TweenService = game:GetService("TweenService")
+local ContextActionService = game:GetService("ContextActionService")
+
+----------------------------------------------------------------------
+-- CONFIG  (everything is live: the menu edits this table at runtime)
+----------------------------------------------------------------------
+export type Mode = "All" | "Teammates"
+export type BoxStyle = "Corners" | "Full"
+export type TracerOrigin = "Bottom" | "Center" | "Top"
+export type Corner = "TopLeft" | "TopRight" | "BottomLeft" | "BottomRight"
+
+local Config = {
+	Enabled = true,
+	Mode = "All" :: Mode,
+	NeutralCountsAsTeam = false,
+
+	-- Pooling
+	PoolSize = 64,
+	MaxActiveTags = 64, -- soft cap below PoolSize (menu slider)
+	ArrowPoolSize = 24,
+
+	-- Culling
+	MaxRenderDistance = 10000,
+	MinRenderDistance = 100,
+	MaxRenderDistanceCap = 50000,
+	ScreenRadius = 2200,
+	MinScreenRadius = 100,
+	MaxScreenRadius = 3000,
+	UseOcclusion = false,
+	OcclusionInterval = 0.1,
+
+	-- Level of detail (studs)
+	NearDetailDistance = 300, -- name + bar + distance + HP
+	MidDetailDistance = 1800, -- name + distance; beyond: box + distance
+
+	-- ESP toggles
+	ShowBoxes = true,
+	BoxStyle = "Corners" :: BoxStyle,
+	ShowTracers = true,
+	TracerOrigin = "Bottom" :: TracerOrigin,
+	ShowNames = true,
+	ShowHealth = true,
+	ShowDistance = true,
+	ShowChams = false, -- NOTE: Roblox renders at most 31 Highlights at once
+	ChamsFillTransparency = 0.65,
+	ShowArrows = true,
+	ArrowRadius = 0.82, -- fraction of the screen half-size
+
+	FadeTime = 0.2,
+
+	-- Box
+	BoxWidthStuds = 3.6,
+	BoxHeightStuds = 6.2,
+	MinBoxWidth = 10,
+	MinBoxHeight = 18,
+	BracketThickness = 2,
+	BracketLenX = 0.3,
+	BracketLenY = 0.22,
+	BoxFillTransparency = 0.94,
+	FocusFillTransparency = 0.82,
+
+	-- Tracer
+	TracerThickness = 1.5,
+	TracerOpacity = 0.55,
+
+	-- Focus (target nearest the crosshair)
+	FocusRadius = 170,
+	FocusColor = Color3.fromRGB(255, 255, 255),
+
+	-- Relationship colours
+	AllyColor = Color3.fromRGB(70, 200, 255),
+	EnemyColor = Color3.fromRGB(255, 70, 80),
+	NeutralColor = Color3.fromRGB(255, 200, 70),
+
+	-- Name tag
+	TagSize = UDim2.fromOffset(150, 44),
+	TagStudsOffset = Vector3.new(0, 1.6, 0),
+	NameTextSize = 14,
+	NameFont = Enum.Font.GothamBold,
+	BarHeight = 8,
+	BarBackColor = Color3.fromRGB(14, 16, 20),
+	BarBackTransparency = 0.2,
+	GhostColor = Color3.fromRGB(255, 255, 255),
+	GhostDelay = 0.35,
+	GhostDrain = 0.8,
+	ColorFull = Color3.fromRGB(80, 230, 110),
+	ColorHalf = Color3.fromRGB(255, 210, 60),
+	ColorEmpty = Color3.fromRGB(235, 60, 60),
+	StudsToMeters = 0.28,
+
+	-- Screen overlay
+	ShowWatermark = true,
+	ShowFocusCard = true,
+	ShowFocusRing = false,
+	ShowCrosshair = false,
+	CrosshairSize = 8,
+	CrosshairGap = 4,
+	CrosshairThickness = 2,
+	CrosshairDot = true,
+	CrosshairColor = Color3.fromRGB(255, 255, 255),
+	ShowRadar = true,
+	RadarSize = 180,
+	RadarRange = 500, -- studs
+	RadarCorner = "BottomLeft" :: Corner,
+
+	-- Spectate
+	FreecamSpeed = 60,
+
+	-- Keys
+	ToggleHudKey = Enum.KeyCode.H,
+	ToggleMenuKey = Enum.KeyCode.F6,
+	SpectateNextKey = Enum.KeyCode.Period,
+	SpectatePrevKey = Enum.KeyCode.Comma,
+	FreecamKey = Enum.KeyCode.F7,
+
+	-- Menu
+	MenuStartsVisible = true,
+	MenuScale = 1,
+	MenuOpacity = 0.06,
+	Accent = Color3.fromRGB(0, 220, 255),
+}
+
+local Defaults = table.clone(Config)
+
+local Presets: { { Name: string, Values: { [string]: any } } } = {
+	{
+		Name = "Tactical",
+		Values = {
+			Mode = "Teammates", ShowBoxes = true, BoxStyle = "Corners", ShowTracers = false, ShowNames = true,
+			ShowHealth = true, ShowDistance = true, ShowChams = false, ShowArrows = true, MaxRenderDistance = 800,
+			ShowRadar = true, ShowCrosshair = false, ShowFocusCard = true,
+		},
+	},
+	{
+		Name = "Spectator",
+		Values = {
+			Mode = "All", ShowBoxes = true, BoxStyle = "Corners", ShowTracers = true, TracerOrigin = "Bottom",
+			ShowNames = true, ShowHealth = true, ShowDistance = true, ShowChams = true, ShowArrows = true,
+			MaxRenderDistance = 10000, ShowRadar = true, ShowFocusCard = true, ShowWatermark = true,
+		},
+	},
+	{
+		Name = "Minimal",
+		Values = {
+			Mode = "All", ShowBoxes = false, ShowTracers = false, ShowNames = true, ShowHealth = true,
+			ShowDistance = false, ShowChams = false, ShowArrows = false, MaxRenderDistance = 300,
+			ShowRadar = false, ShowCrosshair = false, ShowFocusCard = false, ShowWatermark = false,
+		},
+	},
+	{
+		Name = "Max Range",
+		Values = {
+			Mode = "All", ShowBoxes = true, BoxStyle = "Full", ShowTracers = false, ShowNames = false,
+			ShowHealth = false, ShowDistance = true, ShowChams = false, ShowArrows = true,
+			MaxRenderDistance = 50000, ScreenRadius = 3000, ShowRadar = true, RadarRange = 3000,
+		},
+	},
+}
+
+local Theme = {
+	Bg = Color3.fromRGB(11, 13, 17),
+	Side = Color3.fromRGB(16, 19, 25),
+	Row = Color3.fromRGB(22, 26, 34),
+	RowHover = Color3.fromRGB(30, 35, 46),
+	Stroke = Color3.fromRGB(42, 48, 62),
+	Text = Color3.fromRGB(226, 230, 238),
+	Muted = Color3.fromRGB(135, 146, 163),
+	Off = Color3.fromRGB(54, 60, 74),
+	Accent = Config.Accent,
+}
+
+local Palette = {
+	Color3.fromRGB(0, 220, 255),
+	Color3.fromRGB(150, 110, 255),
+	Color3.fromRGB(110, 255, 130),
+	Color3.fromRGB(255, 150, 50),
+	Color3.fromRGB(255, 90, 190),
+	Color3.fromRGB(255, 70, 80),
+	Color3.fromRGB(255, 200, 70),
+	Color3.fromRGB(70, 130, 255),
+	Color3.fromRGB(255, 255, 255),
+}
+
+----------------------------------------------------------------------
+-- UTILS
+----------------------------------------------------------------------
+local Utils = {}
+
+-- Green (1.0) -> Yellow (0.5) -> Red (0.0). Only called on health events.
+function Utils.HealthColor(frac: number): Color3
+	frac = math.clamp(frac, 0, 1)
+	if frac >= 0.5 then
+		return Config.ColorHalf:Lerp(Config.ColorFull, (frac - 0.5) * 2)
+	end
+	return Config.ColorEmpty:Lerp(Config.ColorHalf, frac * 2)
+end
+
+-- Instance factory: properties first, Parent last (avoids redundant re-layout).
+function Utils.New(className: string, props: { [string]: any }, parent: Instance?): any
+	local inst = Instance.new(className :: any) :: any
+	for k, v in props do
+		inst[k] = v
+	end
+	if parent then
+		inst.Parent = parent
+	end
+	return inst
+end
+local New = Utils.New
+
+export type Janitor = {
+	Add: (self: Janitor, conn: RBXScriptConnection) -> RBXScriptConnection,
+	Clean: (self: Janitor) -> (),
+}
+
+function Utils.NewJanitor(): Janitor
+	local conns: { RBXScriptConnection } = {}
+	local self = {}
+	function self.Add(_, conn: RBXScriptConnection)
+		table.insert(conns, conn)
+		return conn
+	end
+	function self.Clean(_)
+		for i = #conns, 1, -1 do
+			conns[i]:Disconnect()
+		end
+		table.clear(conns)
+	end
+	return self :: any
+end
+
+----------------------------------------------------------------------
+-- POOL
+-- Why: Instance.new/Destroy churn creates garbage (GC hitches) and layout
+-- work. Pay construction once at startup, then only recycle. Acquire()
+-- returns nil when empty rather than allocating, so PoolSize is a hard
+-- budget on worst-case UI cost.
+----------------------------------------------------------------------
+export type Pool<T> = {
+	Acquire: (self: Pool<T>) -> T?,
+	Release: (self: Pool<T>, item: T) -> (),
+	FreeCount: (self: Pool<T>) -> number,
+	Capacity: (self: Pool<T>) -> number,
+	Destroy: (self: Pool<T>) -> (),
+}
+
+local Pool = {}
+Pool.__index = Pool
+
+function Pool.new<T>(size: number, factory: () -> T, onRelease: (T) -> (), onDestroy: (T) -> ()): Pool<T>
+	local self = {
+		_free = table.create(size) :: { T },
+		_freeCount = 0,
+		_all = table.create(size) :: { T },
+		_inPool = {} :: { [T]: boolean }, -- pre-populated: flipping values never rehashes
+		_onRelease = onRelease,
+		_onDestroy = onDestroy,
+	}
+	for i = 1, size do
+		local item = factory()
+		onRelease(item)
+		self._all[i] = item
+		self._free[i] = item
+		self._inPool[item] = true
+	end
+	self._freeCount = size
+	return setmetatable(self, Pool) :: any
+end
+
+function Pool.Acquire<T>(self: any): T?
+	local n: number = self._freeCount
+	if n == 0 then
+		return nil
+	end
+	local item = self._free[n]
+	self._free[n] = nil
+	self._freeCount = n - 1
+	self._inPool[item] = false
+	return item
+end
+
+function Pool.Release<T>(self: any, item: T)
+	if self._inPool[item] ~= false then
+		return -- unknown item or double release
+	end
+	self._onRelease(item)
+	self._inPool[item] = true
+	local n: number = self._freeCount + 1
+	self._free[n] = item
+	self._freeCount = n
+end
+
+function Pool.FreeCount(self: any): number
+	return self._freeCount
+end
+
+function Pool.Capacity(self: any): number
+	return #self._all
+end
+
+function Pool.Destroy(self: any)
+	for _, item in self._all do
+		self._onDestroy(item)
+	end
+	table.clear(self._all)
+	table.clear(self._free)
+	table.clear(self._inPool)
+	self._freeCount = 0
+end
+
+----------------------------------------------------------------------
+-- UI  (menu library: tabs, switches, sliders, cycles, swatches, keybinds)
+-- Runs on input events only, never in the render loop, so it may use
+-- tweens and string formatting freely.
+----------------------------------------------------------------------
+local localPlayer = Players.LocalPlayer
+
+local function createMenu(janitor: Janitor, onChange: () -> ()): any
+	local menu: any = {}
+	local accentRefs = {} :: { { Inst: any, Prop: string } }
+	local refreshers = {} :: { () -> () }
+	local tabs = {} :: { { Page: ScrollingFrame, Bar: Frame, Label: TextLabel, Button: TextButton } }
+	local activeDrag: ((InputObject) -> ())? = nil
+	local listening: { Button: TextButton, Set: (Enum.KeyCode) -> () }? = nil
+	local shown = Config.MenuStartsVisible
+	local showToken = 0
+	local tweenInfo = TweenInfo.new(0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+
+	local function accent(inst: any, prop: string)
+		table.insert(accentRefs, { Inst = inst, Prop = prop })
+		inst[prop] = Theme.Accent
+	end
+	local function register(f: () -> ())
+		table.insert(refreshers, f)
+		f()
+	end
+	local function refreshAll()
+		for _, f in refreshers do
+			f()
+		end
+	end
+	menu.Refresh = refreshAll
+	menu.Register = register
+
+	-- Window -------------------------------------------------------------
+	local gui = New("ScreenGui", {
+		Name = "TacticalHUD_Menu", ResetOnSpawn = false, DisplayOrder = 100,
+		IgnoreGuiInset = true, Enabled = shown,
+	}, localPlayer:WaitForChild("PlayerGui"))
+	menu.Gui = gui
+
+	local window = New("Frame", {
+		Name = "Window", AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+		Size = UDim2.fromOffset(640, 420), BackgroundTransparency = 1,
+	}, gui)
+	local scale = New("UIScale", { Scale = Config.MenuScale }, window)
+	New("UICorner", { CornerRadius = UDim.new(0, 12) }, window)
+	local stroke = New("UIStroke", { Thickness = 1.5, Transparency = 0.45 }, window)
+	accent(stroke, "Color")
+
+	local body = New("CanvasGroup", {
+		Size = UDim2.fromScale(1, 1), BackgroundColor3 = Theme.Bg,
+		BackgroundTransparency = Config.MenuOpacity, BorderSizePixel = 0,
+	}, window)
+	New("UICorner", { CornerRadius = UDim.new(0, 12) }, body)
+
+	-- Title bar (drag handle)
+	local titleBar = New("TextButton", {
+		Size = UDim2.new(1, -50, 0, 42), BackgroundTransparency = 1, Text = "", AutoButtonColor = false,
+	}, body)
+	local title = New("TextLabel", {
+		BackgroundTransparency = 1, Position = UDim2.fromOffset(16, 0), Size = UDim2.new(0, 150, 1, 0),
+		Font = Enum.Font.GothamBlack, TextSize = 16, TextXAlignment = Enum.TextXAlignment.Left,
+		Text = "TACTICAL HUD",
+	}, titleBar)
+	accent(title, "TextColor3")
+	New("TextLabel", {
+		BackgroundTransparency = 1, Position = UDim2.fromOffset(150, 2), Size = UDim2.new(1, -150, 1, 0),
+		Font = Enum.Font.GothamMedium, TextSize = 11, TextColor3 = Theme.Muted,
+		TextXAlignment = Enum.TextXAlignment.Left, Text = "v3  |  drag to move",
+	}, titleBar)
+	New("Frame", {
+		Position = UDim2.fromOffset(0, 42), Size = UDim2.new(1, 0, 0, 1),
+		BackgroundColor3 = Theme.Stroke, BorderSizePixel = 0,
+	}, body)
+
+	local closeBtn = New("TextButton", {
+		AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -8, 0, 7), Size = UDim2.fromOffset(28, 28),
+		BackgroundColor3 = Theme.Row, Text = "×", Font = Enum.Font.GothamBold, TextSize = 20,
+		TextColor3 = Theme.Text, AutoButtonColor = true, BorderSizePixel = 0,
+	}, body)
+	New("UICorner", { CornerRadius = UDim.new(0, 7) }, closeBtn)
+
+	-- Sidebar + content
+	local sidebar = New("Frame", {
+		Position = UDim2.fromOffset(0, 43), Size = UDim2.new(0, 140, 1, -43),
+		BackgroundColor3 = Theme.Side, BackgroundTransparency = 0.2, BorderSizePixel = 0,
+	}, body)
+	New("UIPadding", {
+		PaddingTop = UDim.new(0, 10), PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8),
+	}, sidebar)
+	New("UIListLayout", { Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder }, sidebar)
+
+	local hint = New("TextLabel", {
+		AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 10, 1, -8), Size = UDim2.new(0, 120, 0, 28),
+		BackgroundTransparency = 1, Font = Enum.Font.Gotham, TextSize = 10, TextColor3 = Theme.Muted,
+		TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Bottom,
+		TextWrapped = true, Text = "",
+	}, body)
+	register(function()
+		hint.Text = ("%s HUD  |  %s menu"):format(Config.ToggleHudKey.Name, Config.ToggleMenuKey.Name)
+	end)
+
+	local content = New("Frame", {
+		Position = UDim2.fromOffset(140, 43), Size = UDim2.new(1, -140, 1, -43),
+		BackgroundTransparency = 1, ClipsDescendants = true,
+	}, body)
+
+	local toast = New("TextLabel", {
+		AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.new(0.5, 0, 1, -10), AutomaticSize = Enum.AutomaticSize.XY,
+		BackgroundColor3 = Theme.RowHover, BackgroundTransparency = 1, TextTransparency = 1, ZIndex = 10,
+		Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = Theme.Text, Text = "",
+	}, content)
+	New("UIPadding", {
+		PaddingTop = UDim.new(0, 6), PaddingBottom = UDim.new(0, 6),
+		PaddingLeft = UDim.new(0, 14), PaddingRight = UDim.new(0, 14),
+	}, toast)
+	New("UICorner", { CornerRadius = UDim.new(1, 0) }, toast)
+	local toastToken = 0
+	function menu.Toast(text: string)
+		toastToken += 1
+		local token = toastToken
+		toast.Text = text
+		toast.BackgroundTransparency = 0.1
+		toast.TextTransparency = 0
+		task.delay(1.6, function()
+			if token == toastToken and toast.Parent then
+				TweenService:Create(toast, tweenInfo, { BackgroundTransparency = 1, TextTransparency = 1 }):Play()
+			end
+		end)
+	end
+
+	-- Visibility / theme -------------------------------------------------
+	function menu.SetVisible(v: boolean)
+		shown = v
+		showToken += 1
+		local token = showToken
+		if v then
+			gui.Enabled = true
+			body.GroupTransparency = 1
+			scale.Scale = Config.MenuScale * 0.94
+			TweenService:Create(body, tweenInfo, { GroupTransparency = 0 }):Play()
+			TweenService:Create(scale, tweenInfo, { Scale = Config.MenuScale }):Play()
+		else
+			TweenService:Create(body, tweenInfo, { GroupTransparency = 1 }):Play()
+			TweenService:Create(scale, tweenInfo, { Scale = Config.MenuScale * 0.94 }):Play()
+			task.delay(0.16, function()
+				if token == showToken then
+					gui.Enabled = false
+				end
+			end)
+		end
+	end
+	function menu.Toggle()
+		menu.SetVisible(not shown)
+	end
+	function menu.SetAccent(c: Color3)
+		Theme.Accent = c
+		for _, ref in accentRefs do
+			ref.Inst[ref.Prop] = c
+		end
+		refreshAll()
+	end
+	function menu.SetScale(s: number)
+		scale.Scale = s
+	end
+	function menu.SetOpacity(t: number)
+		body.BackgroundTransparency = t
+	end
+	function menu.Destroy()
+		gui:Destroy()
+	end
+
+	-- Global input plumbing (drag + key capture) ------------------------
+	janitor:Add(UserInputService.InputChanged:Connect(function(input)
+		if activeDrag and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+			activeDrag(input)
+		end
+	end))
+	janitor:Add(UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			activeDrag = nil
+		end
+	end))
+
+	-- Returns true when the key was consumed by a pending keybind capture.
+	function menu.HandleKey(input: InputObject): boolean
+		local l = listening
+		if not l or input.UserInputType ~= Enum.UserInputType.Keyboard then
+			return false
+		end
+		listening = nil
+		if input.KeyCode ~= Enum.KeyCode.Escape and input.KeyCode ~= Enum.KeyCode.Unknown then
+			l.Set(input.KeyCode)
+			onChange()
+		end
+		refreshAll()
+		return true
+	end
+
+	janitor:Add(titleBar.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			local startPos = window.Position
+			local startIn = input.Position
+			activeDrag = function(i)
+				local d = i.Position - startIn
+				local s = scale.Scale
+				window.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X / s, startPos.Y.Scale, startPos.Y.Offset + d.Y / s)
+			end
+		end
+	end))
+	janitor:Add(closeBtn.Activated:Connect(function()
+		menu.SetVisible(false)
+	end))
+
+	-- Tabs ---------------------------------------------------------------
+	local function selectTab(index: number)
+		for i, t in tabs do
+			local active = i == index
+			t.Page.Visible = active
+			t.Bar.Visible = active
+			t.Label.TextColor3 = if active then Theme.Text else Theme.Muted
+			t.Button.BackgroundTransparency = if active then 0.35 else 1
+		end
+	end
+
+	function menu.AddTab(name: string): any
+		local index = #tabs + 1
+		local btn = New("TextButton", {
+			Size = UDim2.new(1, 0, 0, 36), BackgroundColor3 = Theme.Row, BackgroundTransparency = 1,
+			Text = "", AutoButtonColor = false, BorderSizePixel = 0, LayoutOrder = index,
+		}, sidebar)
+		New("UICorner", { CornerRadius = UDim.new(0, 8) }, btn)
+		local label = New("TextLabel", {
+			BackgroundTransparency = 1, Position = UDim2.fromOffset(16, 0), Size = UDim2.new(1, -16, 1, 0),
+			Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = Theme.Muted,
+			TextXAlignment = Enum.TextXAlignment.Left, Text = name:upper(),
+		}, btn)
+		local bar = New("Frame", {
+			AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.fromScale(0, 0.5), Size = UDim2.new(0, 3, 0.55, 0),
+			BorderSizePixel = 0, Visible = false,
+		}, btn)
+		accent(bar, "BackgroundColor3")
+		New("UICorner", { CornerRadius = UDim.new(1, 0) }, bar)
+
+		local page = New("ScrollingFrame", {
+			Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, BorderSizePixel = 0,
+			ScrollBarThickness = 3, AutomaticCanvasSize = Enum.AutomaticSize.Y,
+			CanvasSize = UDim2.new(), Visible = false,
+		}, content)
+		accent(page, "ScrollBarImageColor3")
+		New("UIPadding", {
+			PaddingTop = UDim.new(0, 10), PaddingBottom = UDim.new(0, 14),
+			PaddingLeft = UDim.new(0, 12), PaddingRight = UDim.new(0, 14),
+		}, page)
+		New("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, page)
+
+		tabs[index] = { Page = page, Bar = bar, Label = label, Button = btn }
+		janitor:Add(btn.Activated:Connect(function()
+			selectTab(index)
+		end))
+		if index == 1 then
+			selectTab(1)
+		end
+
+		local tab: any = {}
+		local order = 0
+		local function nextOrder(): number
+			order += 1
+			return order
+		end
+		local function makeRow(height: number): Frame
+			local r = New("Frame", {
+				Size = UDim2.new(1, 0, 0, height), BackgroundColor3 = Theme.Row,
+				BorderSizePixel = 0, LayoutOrder = nextOrder(),
+			}, page)
+			New("UICorner", { CornerRadius = UDim.new(0, 7) }, r)
+			return r
+		end
+		local function rowLabel(row: Frame, text: string, widthOffset: number): TextLabel
+			return New("TextLabel", {
+				BackgroundTransparency = 1, Position = UDim2.fromOffset(12, 0), Size = UDim2.new(1, widthOffset, 1, 0),
+				Font = Enum.Font.GothamMedium, TextSize = 13, TextColor3 = Theme.Text,
+				TextXAlignment = Enum.TextXAlignment.Left, Text = text,
+			}, row)
+		end
+		local function hover(btn: GuiButton, row: Frame)
+			janitor:Add(btn.MouseEnter:Connect(function()
+				row.BackgroundColor3 = Theme.RowHover
+			end))
+			janitor:Add(btn.MouseLeave:Connect(function()
+				row.BackgroundColor3 = Theme.Row
+			end))
+		end
+		local function small(parent: Instance, text: string, size: UDim2): TextButton
+			local b = New("TextButton", {
+				Size = size, BackgroundColor3 = Theme.Off, BorderSizePixel = 0, Text = text,
+				Font = Enum.Font.GothamBold, TextSize = 12, TextColor3 = Theme.Text, AutoButtonColor = true,
+			}, parent)
+			New("UICorner", { CornerRadius = UDim.new(0, 6) }, b)
+			return b
+		end
+
+		function tab.Section(titleText: string)
+			local f = New("Frame", { Size = UDim2.new(1, 0, 0, 26), BackgroundTransparency = 1, LayoutOrder = nextOrder() }, page)
+			local l = New("TextLabel", {
+				BackgroundTransparency = 1, Size = UDim2.new(1, 0, 1, -4), Font = Enum.Font.GothamBold, TextSize = 11,
+				TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Bottom,
+				Text = titleText:upper(),
+			}, f)
+			accent(l, "TextColor3")
+			New("Frame", {
+				AnchorPoint = Vector2.new(0, 1), Position = UDim2.fromScale(0, 1), Size = UDim2.new(1, 0, 0, 1),
+				BackgroundColor3 = Theme.Stroke, BorderSizePixel = 0,
+			}, f)
+		end
+
+		function tab.Toggle(text: string, get: () -> boolean, set: (boolean) -> ())
+			local row = makeRow(32)
+			local btn = New("TextButton", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = "", AutoButtonColor = false }, row)
+			rowLabel(row, text, -70)
+			local track = New("Frame", {
+				AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -10, 0.5, 0), Size = UDim2.fromOffset(38, 18),
+				BackgroundColor3 = Theme.Off, BorderSizePixel = 0,
+			}, row)
+			New("UICorner", { CornerRadius = UDim.new(1, 0) }, track)
+			local knob = New("Frame", {
+				AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 2, 0.5, 0), Size = UDim2.fromOffset(14, 14),
+				BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0,
+			}, track)
+			New("UICorner", { CornerRadius = UDim.new(1, 0) }, knob)
+			local last: boolean? = nil
+			register(function()
+				local on = get()
+				track.BackgroundColor3 = if on then Theme.Accent else Theme.Off
+				local target = if on then UDim2.new(0, 22, 0.5, 0) else UDim2.new(0, 2, 0.5, 0)
+				if last == nil then
+					knob.Position = target
+				elseif last ~= on then
+					TweenService:Create(knob, tweenInfo, { Position = target }):Play()
+				end
+				last = on
+			end)
+			hover(btn, row)
+			janitor:Add(btn.Activated:Connect(function()
+				set(not get())
+				onChange()
+				refreshAll()
+			end))
+		end
+
+		function tab.Slider(text: string, min: number, max: number, get: () -> number, set: (number) -> (), opts: any?)
+			local o: any = opts or {}
+			local step: number? = o.Step
+			local isLog: boolean = o.Log == true
+			local fmt: (number) -> string = o.Format or function(v: number)
+				return tostring(math.floor(v * 100 + 0.5) / 100)
+			end
+			local row = makeRow(46)
+			rowLabel(row, text, -90).Position = UDim2.fromOffset(12, -6)
+			local value = New("TextLabel", {
+				AnchorPoint = Vector2.new(1, 0), BackgroundTransparency = 1, Position = UDim2.new(1, -12, 0, 6),
+				Size = UDim2.fromOffset(120, 16), Font = Enum.Font.GothamBold, TextSize = 12,
+				TextXAlignment = Enum.TextXAlignment.Right,
+			}, row)
+			accent(value, "TextColor3")
+			local track = New("Frame", {
+				Position = UDim2.new(0, 12, 1, -16), Size = UDim2.new(1, -24, 0, 6),
+				BackgroundColor3 = Theme.Off, BorderSizePixel = 0,
+			}, row)
+			New("UICorner", { CornerRadius = UDim.new(1, 0) }, track)
+			local fill = New("Frame", { Size = UDim2.fromScale(0, 1), BorderSizePixel = 0 }, track)
+			accent(fill, "BackgroundColor3")
+			New("UICorner", { CornerRadius = UDim.new(1, 0) }, fill)
+			local knob = New("Frame", {
+				AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0, 0.5), Size = UDim2.fromOffset(12, 12),
+				BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0, ZIndex = 2,
+			}, track)
+			New("UICorner", { CornerRadius = UDim.new(1, 0) }, knob)
+			local hit = New("TextButton", {
+				Position = UDim2.new(0, 12, 1, -26), Size = UDim2.new(1, -24, 0, 26),
+				BackgroundTransparency = 1, Text = "", AutoButtonColor = false, ZIndex = 3,
+			}, row)
+
+			local function fromX(x: number)
+				local a = math.clamp((x - track.AbsolutePosition.X) / math.max(track.AbsoluteSize.X, 1), 0, 1)
+				local v = if isLog then min * (max / min) ^ a else min + (max - min) * a
+				if step then
+					v = math.floor(v / step + 0.5) * step
+				end
+				set(math.clamp(v, min, max))
+				onChange()
+				refreshAll()
+			end
+			janitor:Add(hit.InputBegan:Connect(function(input)
+				if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+					activeDrag = function(i)
+						fromX(i.Position.X)
+					end
+					fromX(input.Position.X)
+				end
+			end))
+			register(function()
+				local v = get()
+				local a = if isLog then math.log(v / min) / math.log(max / min) else (v - min) / (max - min)
+				a = math.clamp(a, 0, 1)
+				fill.Size = UDim2.fromScale(a, 1)
+				knob.Position = UDim2.fromScale(a, 0.5)
+				value.Text = fmt(v)
+			end)
+		end
+
+		function tab.Cycle(text: string, options: { string }, get: () -> string, set: (string) -> ())
+			local row = makeRow(32)
+			rowLabel(row, text, -130)
+			local btn = small(row, "", UDim2.fromOffset(112, 22))
+			btn.AnchorPoint = Vector2.new(1, 0.5)
+			btn.Position = UDim2.new(1, -10, 0.5, 0)
+			accent(btn, "TextColor3")
+			register(function()
+				btn.Text = get()
+			end)
+			janitor:Add(btn.Activated:Connect(function()
+				local idx = table.find(options, get()) or 0
+				set(options[idx % #options + 1])
+				onChange()
+				refreshAll()
+			end))
+		end
+
+		function tab.Swatches(text: string, get: () -> Color3, set: (Color3) -> ())
+			local row = makeRow(32)
+			rowLabel(row, text, -230)
+			local holder = New("Frame", {
+				AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -8, 0.5, 0), Size = UDim2.fromOffset(#Palette * 22, 20),
+				BackgroundTransparency = 1,
+			}, row)
+			New("UIListLayout", {
+				FillDirection = Enum.FillDirection.Horizontal, Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder,
+				VerticalAlignment = Enum.VerticalAlignment.Center,
+			}, holder)
+			local strokes = {} :: { UIStroke }
+			for i, color in Palette do
+				local sw = New("TextButton", {
+					Size = UDim2.fromOffset(18, 18), BackgroundColor3 = color, Text = "", AutoButtonColor = false,
+					BorderSizePixel = 0, LayoutOrder = i,
+				}, holder)
+				New("UICorner", { CornerRadius = UDim.new(1, 0) }, sw)
+				strokes[i] = New("UIStroke", { Color = Color3.new(1, 1, 1), Thickness = 2, Enabled = false }, sw)
+				janitor:Add(sw.Activated:Connect(function()
+					set(color)
+					onChange()
+					refreshAll()
+				end))
+			end
+			register(function()
+				local cur = get()
+				for i, color in Palette do
+					strokes[i].Enabled = color == cur
+				end
+			end)
+		end
+
+		function tab.Keybind(text: string, get: () -> Enum.KeyCode, set: (Enum.KeyCode) -> ())
+			local row = makeRow(32)
+			rowLabel(row, text, -130)
+			local btn = small(row, "", UDim2.fromOffset(112, 22))
+			btn.AnchorPoint = Vector2.new(1, 0.5)
+			btn.Position = UDim2.new(1, -10, 0.5, 0)
+			register(function()
+				local l = listening
+				if l and l.Button == btn then
+					btn.Text = "press a key..."
+					btn.TextColor3 = Theme.Accent
+				else
+					btn.Text = get().Name
+					btn.TextColor3 = Theme.Text
+				end
+			end)
+			janitor:Add(btn.Activated:Connect(function()
+				listening = { Button = btn, Set = set }
+				refreshAll()
+			end))
+		end
+
+		function tab.Button(text: string, onClick: () -> (), danger: boolean?)
+			local row = makeRow(32)
+			local btn = New("TextButton", {
+				Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Text = text, Font = Enum.Font.GothamBold,
+				TextSize = 12, AutoButtonColor = false, TextColor3 = if danger then Config.EnemyColor else Theme.Text,
+			}, row)
+			local s = New("UIStroke", { Thickness = 1, Transparency = 0.5 }, row)
+			if danger then
+				s.Color = Config.EnemyColor
+			else
+				accent(s, "Color")
+			end
+			hover(btn, row)
+			janitor:Add(btn.Activated:Connect(onClick))
+		end
+
+		-- Multi-line text area. Returns the label so callers can stream text into it.
+		function tab.Info(height: number, getText: (() -> string)?): TextLabel
+			local row = makeRow(height)
+			local l = New("TextLabel", {
+				BackgroundTransparency = 1, Position = UDim2.fromOffset(12, 6), Size = UDim2.new(1, -24, 1, -12),
+				Font = Enum.Font.Code, TextSize = 12, TextColor3 = Theme.Muted, TextWrapped = true,
+				TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top, Text = "",
+			}, row)
+			if getText then
+				register(function()
+					l.Text = getText()
+				end)
+			end
+			return l
+		end
+
+		function tab.Container(height: number): Frame
+			return makeRow(height)
+		end
+
+		return tab
+	end
+
+	return menu
+end
+
+----------------------------------------------------------------------
+-- HUD MANAGER
+----------------------------------------------------------------------
+export type Tag = {
+	-- world-space name tag
+	Gui: BillboardGui,
+	Group: CanvasGroup,
+	Name: TextLabel,
+	Info: TextLabel,
+	BarBack: Frame,
+	Ghost: Frame,
+	Fill: Frame,
+	-- screen-space overlay
+	Box: CanvasGroup,
+	BoxFill: Frame,
+	Brackets: { Frame },
+	BracketH: { boolean }, -- parallel to Brackets: true = horizontal arm
+	Tracer: Frame,
+	Chams: Highlight,
+}
+
+type Record = {
+	Player: Player,
+	Character: Model?,
+	Anchor: BasePart?, -- Head: name tag attachment
+	Root: BasePart?, -- HumanoidRootPart: culling + box centre
+	Tag: Tag?,
+	Arrow: TextLabel?,
+	ArrowAccent: Color3?,
+	Alpha: number,
+	AppliedAlpha: number,
+	Health: number,
+	MaxHealth: number,
+	HealthFrac: number,
+	GhostFrac: number,
+	GhostHold: number,
+	Alive: boolean,
+	Occluded: boolean,
+	NextOcclusionCheck: number,
+	BindToken: number,
+	-- style cache: properties are only rewritten when one of these changes
+	Tier: number,
+	Focused: boolean,
+	Accent: Color3?,
+	AppliedCfg: number,
+	LastDistM: number,
+	CharJanitor: Janitor,
+	PlayerJanitor: Janitor,
+}
+
+local HUDManager = {}
+HUDManager.__index = HUDManager
+
+local function createTag(tagParent: Instance, overlay: Instance): Tag
+	local gui = New("BillboardGui", {
+		Name = "Tag", Size = Config.TagSize, StudsOffset = Config.TagStudsOffset,
+		-- Bottom edge sits on the anchor so the tag stays above the box at any range.
+		-- If it sits below instead, negate the Y.
+		SizeOffset = Vector2.new(0, 0.5), AlwaysOnTop = true, LightInfluence = 0, ResetOnSpawn = false,
+		MaxDistance = math.huge, -- distance culling is ours, not the engine's
+		Enabled = false,
+	})
+	local group = New("CanvasGroup", {
+		Name = "Group", BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), GroupTransparency = 1,
+	}, gui)
+	local nameLabel = New("TextLabel", {
+		Name = "Name", BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, Config.NameTextSize + 2),
+		Font = Config.NameFont, TextSize = Config.NameTextSize, TextStrokeTransparency = 0.4,
+		TextTruncate = Enum.TextTruncate.AtEnd, Text = "",
+	}, group)
+
+	local back = New("Frame", {
+		Name = "BarBack", AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, Config.NameTextSize + 5),
+		Size = UDim2.new(0.8, 0, 0, Config.BarHeight), BackgroundColor3 = Config.BarBackColor,
+		BackgroundTransparency = Config.BarBackTransparency, BorderSizePixel = 0,
+	}, group)
+	New("UICorner", { CornerRadius = UDim.new(0.5, 0) }, back)
+	New("UIStroke", { Color = Color3.new(0, 0, 0), Transparency = 0.35, Thickness = 1 }, back)
+
+	local ghost = New("Frame", {
+		Name = "Ghost", Size = UDim2.fromScale(1, 1), BackgroundColor3 = Config.GhostColor,
+		BackgroundTransparency = 0.45, BorderSizePixel = 0, ZIndex = 1,
+	}, back)
+	New("UICorner", { CornerRadius = UDim.new(0.5, 0) }, ghost)
+	local fill = New("Frame", {
+		Name = "Fill", Size = UDim2.fromScale(1, 1), BackgroundColor3 = Config.ColorFull, BorderSizePixel = 0, ZIndex = 2,
+	}, back)
+	New("UICorner", { CornerRadius = UDim.new(0.5, 0) }, fill)
+	New("UIGradient", {
+		Rotation = 90, Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromRGB(150, 150, 150)),
+	}, fill)
+	for i = 1, 3 do -- 25/50/75% tick marks
+		New("Frame", {
+			Size = UDim2.new(0, 1, 1, 0), Position = UDim2.fromScale(i / 4, 0), BackgroundColor3 = Color3.new(0, 0, 0),
+			BackgroundTransparency = 0.45, BorderSizePixel = 0, ZIndex = 3,
+		}, back)
+	end
+
+	local info = New("TextLabel", {
+		Name = "Info", BackgroundTransparency = 1,
+		Position = UDim2.new(0, 0, 0, Config.NameTextSize + Config.BarHeight + 8), Size = UDim2.new(1, 0, 0, 14),
+		Font = Enum.Font.GothamMedium, TextSize = 11, TextColor3 = Color3.fromRGB(205, 210, 220),
+		TextStrokeTransparency = 0.5, Text = "",
+	}, group)
+	gui.Parent = tagParent
+
+	-- Screen-space box ------------------------------------------------------
+	local box = New("CanvasGroup", {
+		Name = "Box", AnchorPoint = Vector2.new(0.5, 0.5), BackgroundTransparency = 1, GroupTransparency = 1, Visible = false,
+	}, overlay)
+	local boxFill = New("Frame", {
+		Size = UDim2.fromScale(1, 1), BorderSizePixel = 0, BackgroundTransparency = Config.BoxFillTransparency,
+		BackgroundColor3 = Config.AllyColor,
+	}, box)
+
+	local brackets: { Frame } = {}
+	local bracketH: { boolean } = {}
+	for _, corner in { { 0, 0 }, { 1, 0 }, { 0, 1 }, { 1, 1 } } do
+		for _, horizontal in { true, false } do
+			table.insert(brackets, New("Frame", {
+				AnchorPoint = Vector2.new(corner[1], corner[2]), Position = UDim2.fromScale(corner[1], corner[2]),
+				BorderSizePixel = 0, BackgroundColor3 = Config.AllyColor,
+			}, box))
+			table.insert(bracketH, horizontal)
+		end
+	end
+
+	local tracer = New("Frame", {
+		Name = "Tracer", AnchorPoint = Vector2.new(0.5, 0.5), BorderSizePixel = 0, BackgroundTransparency = 1, Visible = false,
+	}, overlay)
+
+	local chams = New("Highlight", {
+		Name = "Chams", DepthMode = Enum.HighlightDepthMode.AlwaysOnTop, FillTransparency = 1,
+		OutlineTransparency = 1, Enabled = false,
+	}, tagParent)
+
+	return {
+		Gui = gui, Group = group, Name = nameLabel, Info = info, BarBack = back, Ghost = ghost, Fill = fill,
+		Box = box, BoxFill = boxFill, Brackets = brackets, BracketH = bracketH, Tracer = tracer, Chams = chams,
+	}
+end
+
+local function resetTag(tag: Tag)
+	tag.Gui.Enabled = false
+	tag.Gui.Adornee = nil
+	tag.Group.GroupTransparency = 1
+	tag.Box.Visible = false
+	tag.Box.GroupTransparency = 1
+	tag.Tracer.Visible = false
+	tag.Chams.Enabled = false
+	tag.Chams.Adornee = nil
+end
+
+local function destroyTag(tag: Tag)
+	tag.Gui:Destroy()
+	tag.Box:Destroy()
+	tag.Tracer:Destroy()
+	tag.Chams:Destroy()
+end
+
+local function applyHealth(tag: Tag, frac: number, ghostFrac: number)
+	tag.Fill.Size = UDim2.fromScale(frac, 1)
+	tag.Fill.BackgroundColor3 = Utils.HealthColor(frac)
+	tag.Ghost.Size = UDim2.fromScale(ghostFrac, 1)
+end
+
+local function createArrow(overlay: Instance): TextLabel
+	return New("TextLabel", {
+		Name = "Arrow", AnchorPoint = Vector2.new(0.5, 0.5), Size = UDim2.fromOffset(26, 26), BackgroundTransparency = 1,
+		Font = Enum.Font.GothamBold, TextSize = 22, Text = "▲", TextStrokeTransparency = 0.3, Visible = false,
+	}, overlay)
+end
+
+function HUDManager.new()
+	local self = setmetatable({}, HUDManager) :: any
+	self._destroyed = false
+	self._janitor = Utils.NewJanitor()
+	self._records = {} :: { [Player]: Record }
+	self._count = 0
+	self._cfgVersion = 0
+	self._focusRec = nil :: Record?
+
+	local playerGui = localPlayer:WaitForChild("PlayerGui")
+	self._folder = New("Folder", { Name = "TacticalHUD_Tags" }, playerGui)
+	-- IgnoreGuiInset so overlay pixels match WorldToViewportPoint output.
+	self._overlay = New("ScreenGui", {
+		Name = "TacticalHUD_Overlay", ResetOnSpawn = false, IgnoreGuiInset = true, DisplayOrder = 5,
+		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+	}, playerGui)
+	self._static = New("ScreenGui", {
+		Name = "TacticalHUD_Static", ResetOnSpawn = false, IgnoreGuiInset = true, DisplayOrder = 4,
+		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+	}, playerGui)
+
+	self._pool = Pool.new(Config.PoolSize, function()
+		return createTag(self._folder, self._overlay)
+	end, resetTag, destroyTag)
+	self._arrowPool = Pool.new(Config.ArrowPoolSize, function()
+		return createArrow(self._overlay)
+	end, function(a: TextLabel)
+		a.Visible = false
+	end, function(a: TextLabel)
+		a:Destroy()
+	end)
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.IgnoreWater = true
+	self._rayParams = params
+
+	self._camera = nil :: Camera?
+	self._camJanitor = Utils.NewJanitor()
+	self._cx, self._cy, self._vh, self._k, self._tracerY = 0, 0, 0, 1, 0
+
+	self._distTimer, self._distTick = 0, false
+	self._statsTimer, self._radarTimer = 0, 0
+	self._fpsFrames, self._fpsTimer, self._fps = 0, 0, 60
+	self._stats = { Total = 0, Mode = 0, Range = 0, Screen = 0, Radius = 0, Visible = 0, Arrows = 0 }
+
+	-- Spectate / freecam state
+	self._specPlayer = nil :: Player?
+	self._specJanitor = Utils.NewJanitor()
+	self._freecam = false
+	self._fcSavedType = Enum.CameraType.Custom
+	self._fcPos, self._fcPitch, self._fcYaw = Vector3.zero, 0, 0
+	return self
+end
+
+function HUDManager._invalidate(self: any)
+	self._cfgVersion += 1
+	self:_applyStatic()
+end
+
+-- Camera / viewport -----------------------------------------------------
+function HUDManager._setCamera(self: any, camera: Camera?)
+	self._camJanitor:Clean()
+	self._camera = camera
+	if not camera then
+		return
+	end
+	local function updateCenter()
+		local vs = camera.ViewportSize
+		self._cx, self._cy, self._vh = vs.X * 0.5, vs.Y * 0.5, vs.Y
+	end
+	updateCenter()
+	self._camJanitor:Add(camera:GetPropertyChangedSignal("ViewportSize"):Connect(updateCenter))
+end
+
+-- Tag lifecycle ---------------------------------------------------------
+function HUDManager._bindTag(self: any, rec: Record, tag: Tag)
+	tag.Gui.Adornee = rec.Anchor
+	tag.Chams.Adornee = rec.Character
+	tag.Name.Text = rec.Player.DisplayName
+	rec.GhostFrac = rec.HealthFrac
+	applyHealth(tag, rec.HealthFrac, rec.GhostFrac)
+	tag.Group.GroupTransparency = 1
+	tag.Box.GroupTransparency = 1
+	tag.Gui.Enabled = true
+	rec.Tag = tag
+	rec.Alpha, rec.AppliedAlpha = 0, 0
+	rec.Tier, rec.AppliedCfg, rec.LastDistM = -1, -1, -1 -- forces a full restyle
+end
+
+function HUDManager._releaseTag(self: any, rec: Record)
+	local tag = rec.Tag
+	if tag then
+		rec.Tag = nil
+		self._pool:Release(tag)
+	end
+	rec.Alpha, rec.AppliedAlpha = 0, 0
+end
+
+function HUDManager._releaseArrow(self: any, rec: Record)
+	local arrow = rec.Arrow
+	if arrow then
+		rec.Arrow = nil
+		rec.ArrowAccent = nil
+		self._arrowPool:Release(arrow)
+	end
+end
+
+-- Character handling ----------------------------------------------------
+function HUDManager._unbindCharacter(self: any, rec: Record)
+	rec.BindToken += 1
+	rec.CharJanitor:Clean()
+	rec.Character, rec.Anchor, rec.Root = nil, nil, nil
+	rec.Alive = false
+	rec.Occluded = false
+	self:_releaseTag(rec) -- immediate: the anchor is gone, nothing to fade
+	self:_releaseArrow(rec)
+end
+
+function HUDManager._bindCharacter(self: any, rec: Record, character: Model)
+	self:_unbindCharacter(rec)
+	local token = rec.BindToken
+	-- Parts replicate slightly after CharacterAdded; wait off the hot path.
+	task.spawn(function()
+		local hum = character:WaitForChild("Humanoid", 10) :: Humanoid?
+		local head = character:WaitForChild("Head", 10) :: BasePart?
+		local root = character:WaitForChild("HumanoidRootPart", 10) :: BasePart?
+		if self._destroyed or rec.BindToken ~= token or not hum or not head or not root then
+			return
+		end
+		rec.Character, rec.Anchor, rec.Root = character, head, root
+
+		-- Event-driven health: runs only when Health/MaxHealth change.
+		local first = true
+		local function refresh()
+			local frac = math.clamp(hum.Health / math.max(hum.MaxHealth, 1), 0, 1)
+			if frac > rec.GhostFrac or first then
+				rec.GhostFrac = frac -- heals / first read: no trail
+			elseif frac < rec.HealthFrac then
+				rec.GhostHold = os.clock() + Config.GhostDelay
+			end
+			first = false
+			rec.Health, rec.MaxHealth = hum.Health, hum.MaxHealth
+			rec.HealthFrac = frac
+			rec.Alive = hum.Health > 0
+			rec.LastDistM = -1 -- re-render the info line on the next tick
+			local tag = rec.Tag
+			if tag then
+				applyHealth(tag, frac, rec.GhostFrac)
+			end
+		end
+		refresh()
+		rec.CharJanitor:Add(hum.HealthChanged:Connect(refresh))
+		rec.CharJanitor:Add(hum:GetPropertyChangedSignal("MaxHealth"):Connect(refresh))
+	end)
+end
+
+-- Player handling -------------------------------------------------------
+function HUDManager._addPlayer(self: any, player: Player)
+	if player == localPlayer or self._records[player] then
+		return
+	end
+	local rec: Record = {
+		Player = player, Character = nil, Anchor = nil, Root = nil, Tag = nil, Arrow = nil, ArrowAccent = nil,
+		Alpha = 0, AppliedAlpha = 0, Health = 100, MaxHealth = 100, HealthFrac = 1, GhostFrac = 1, GhostHold = 0,
+		Alive = false, Occluded = false,
+		NextOcclusionCheck = os.clock() + math.random() * Config.OcclusionInterval, -- spread raycasts across frames
+		BindToken = 0, Tier = -1, Focused = false, Accent = nil, AppliedCfg = -1, LastDistM = -1,
+		CharJanitor = Utils.NewJanitor(), PlayerJanitor = Utils.NewJanitor(),
+	}
+	self._records[player] = rec
+	self._count += 1
+
+	rec.PlayerJanitor:Add(player.CharacterAdded:Connect(function(char)
+		self:_bindCharacter(rec, char)
+	end))
+	rec.PlayerJanitor:Add(player.CharacterRemoving:Connect(function()
+		self:_unbindCharacter(rec)
+	end))
+	if player.Character then
+		self:_bindCharacter(rec, player.Character)
+	end
+	self:_playersChanged()
+end
+
+function HUDManager._removePlayer(self: any, player: Player)
+	local rec = self._records[player]
+	if not rec then
+		return
+	end
+	self._records[player] = nil
+	self._count -= 1
+	if self._focusRec == rec then
+		self._focusRec = nil
+	end
+	if self._specPlayer == player then
+		self:Spectate(nil)
+	end
+	self:_unbindCharacter(rec) -- tag returns to the pool immediately
+	rec.PlayerJanitor:Clean()
+	self:_playersChanged()
+end
+
+function HUDManager._playersChanged(self: any)
+	if self._rebuildList then
+		self._rebuildList()
+	end
+end
+
+-- Classification / culling helpers ----------------------------------------
+function HUDManager._passesMode(self: any, player: Player): boolean
+	if Config.Mode == "All" then
+		return true
+	end
+	local mine, theirs = localPlayer.Team, player.Team
+	if mine == nil and theirs == nil then
+		return Config.NeutralCountsAsTeam
+	end
+	return mine == theirs
+end
+
+-- 0 neutral, 1 ally, 2 enemy
+function HUDManager._relation(self: any, player: Player): number
+	local mine, theirs = localPlayer.Team, player.Team
+	if mine == nil and theirs == nil then
+		return 0
+	end
+	return if mine == theirs then 1 else 2
+end
+
+function HUDManager._accentFor(self: any, player: Player): Color3
+	local r = self:_relation(player)
+	if r == 1 then
+		return Config.AllyColor
+	elseif r == 2 then
+		return Config.EnemyColor
+	end
+	return Config.NeutralColor
+end
+
+-- Raycasts are the priciest cull: they run last, only for targets that
+-- already passed distance + screen tests, and are throttled per target.
+function HUDManager._isOccluded(self: any, rec: Record, camPos: Vector3, targetPos: Vector3, now: number): boolean
+	if now >= rec.NextOcclusionCheck then
+		rec.NextOcclusionCheck = now + Config.OcclusionInterval
+		local hit = Workspace:Raycast(camPos, targetPos - camPos, self._rayParams)
+		local character = rec.Character
+		rec.Occluded = hit ~= nil and character ~= nil and not hit.Instance:IsDescendantOf(character)
+	end
+	return rec.Occluded
+end
+
+-- Style: runs only when tier, focus, relation colour or menu config changes.
+function HUDManager._restyle(self: any, rec: Record, tag: Tag, tier: number, focused: boolean, accent: Color3)
+	rec.Tier, rec.Focused, rec.Accent = tier, focused, accent
+	rec.AppliedCfg = self._cfgVersion
+	rec.LastDistM = -1
+
+	local color = if focused then Config.FocusColor else accent
+	local full = Config.BoxStyle == "Full"
+	local T = Config.BracketThickness
+	for i, b in tag.Brackets do
+		b.BackgroundColor3 = color
+		if tag.BracketH[i] then
+			b.Size = UDim2.new(if full then 1 else Config.BracketLenX, 0, 0, T)
+		else
+			b.Size = UDim2.new(0, T, if full then 1 else Config.BracketLenY, 0)
+		end
+	end
+	tag.BoxFill.BackgroundColor3 = color
+	tag.BoxFill.BackgroundTransparency = if focused then Config.FocusFillTransparency else Config.BoxFillTransparency
+	tag.Tracer.BackgroundColor3 = color
+	tag.Name.TextColor3 = color
+
+	tag.Box.Visible = Config.ShowBoxes
+	tag.Tracer.Visible = Config.ShowTracers
+	tag.Name.Visible = Config.ShowNames and tier <= 1
+	tag.BarBack.Visible = Config.ShowHealth and tier == 0
+	tag.Info.Visible = Config.ShowDistance
+
+	local chams = tag.Chams
+	chams.FillColor, chams.OutlineColor = color, color
+	chams.FillTransparency = 1 - rec.Alpha * (1 - Config.ChamsFillTransparency)
+	chams.OutlineTransparency = 1 - rec.Alpha
+	chams.Enabled = Config.ShowChams and tier <= 1
+end
+
+-- Positions the screen-space pieces for one visible target.
+function HUDManager._layout(self: any, rec: Record, tag: Tag, vx: number, vy: number, depth: number, dist: number)
+	local tier = if dist <= Config.NearDetailDistance then 0 elseif dist <= Config.MidDetailDistance then 1 else 2
+	local focused = rec == self._focusRec
+	local accent = self:_accentFor(rec.Player)
+	if tier ~= rec.Tier or focused ~= rec.Focused or accent ~= rec.Accent or rec.AppliedCfg ~= self._cfgVersion then
+		self:_restyle(rec, tag, tier, focused, accent)
+	end
+
+	-- Pixel size from FOV: studs * (viewportH / (2 * depth * tan(fov/2))).
+	local s = self._k / depth
+	local w = math.max(s * Config.BoxWidthStuds, Config.MinBoxWidth)
+	local h = math.max(s * Config.BoxHeightStuds, Config.MinBoxHeight)
+
+	if Config.ShowBoxes then
+		tag.Box.Position = UDim2.fromOffset(vx, vy)
+		tag.Box.Size = UDim2.fromOffset(w, h)
+	end
+
+	if Config.ShowTracers then
+		local ox, oy = self._cx, self._tracerY
+		local tx = vx
+		local ty = if oy >= self._cy then vy + h * 0.5 else vy - h * 0.5
+		local dx, dy = tx - ox, ty - oy
+		tag.Tracer.Position = UDim2.fromOffset((tx + ox) * 0.5, (ty + oy) * 0.5)
+		tag.Tracer.Size = UDim2.fromOffset(math.sqrt(dx * dx + dy * dy), Config.TracerThickness)
+		tag.Tracer.Rotation = math.deg(math.atan2(dy, dx))
+	end
+
+	-- Info text allocates, so it updates on the 10 Hz tick and only when the shown value changed.
+	if self._distTick and Config.ShowDistance then
+		local m = math.floor(dist * Config.StudsToMeters)
+		if m ~= rec.LastDistM then
+			rec.LastDistM = m
+			if tier == 0 and Config.ShowHealth then
+				tag.Info.Text = string.format("%dm  |  %d HP", m, math.ceil(rec.Health))
+			else
+				tag.Info.Text = string.format("%dm", m)
+			end
+		end
+	end
+end
+
+-- Static overlay (crosshair, ring, watermark, radar, focus card) --------
+function HUDManager._buildStatic(self: any)
+	local root = self._static
+	local accent = Theme.Accent
+
+	-- Crosshair: four arms + dot around the screen centre
+	local ch = New("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.new(), BackgroundTransparency = 1,
+	}, root)
+	local arms = {}
+	for i = 1, 4 do
+		arms[i] = New("Frame", { BorderSizePixel = 0 }, ch)
+	end
+	local dot = New("Frame", { AnchorPoint = Vector2.new(0.5, 0.5), BorderSizePixel = 0 }, ch)
+	self._ch, self._chArms, self._chDot = ch, arms, dot
+
+	-- Focus ring
+	local ring = New("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), BackgroundTransparency = 1,
+	}, root)
+	New("UICorner", { CornerRadius = UDim.new(1, 0) }, ring)
+	self._ringStroke = New("UIStroke", { Thickness = 1.5, Transparency = 0.45, Color = accent }, ring)
+	self._ring = ring
+
+	-- Watermark pill
+	local wm = New("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 10), AutomaticSize = Enum.AutomaticSize.XY,
+		BackgroundColor3 = Theme.Bg, BackgroundTransparency = 0.2, BorderSizePixel = 0,
+	}, root)
+	New("UICorner", { CornerRadius = UDim.new(1, 0) }, wm)
+	self._wmStroke = New("UIStroke", { Thickness = 1, Transparency = 0.5, Color = accent }, wm)
+	New("UIPadding", {
+		PaddingTop = UDim.new(0, 5), PaddingBottom = UDim.new(0, 5), PaddingLeft = UDim.new(0, 14), PaddingRight = UDim.new(0, 14),
+	}, wm)
+	self._wmLabel = New("TextLabel", {
+		AutomaticSize = Enum.AutomaticSize.XY, BackgroundTransparency = 1, Font = Enum.Font.GothamBold, TextSize = 12,
+		TextColor3 = Theme.Text, Text = "TACTICAL HUD",
+	}, wm)
+	self._wm = wm
+
+	-- Radar
+	local radar = New("Frame", {
+		BackgroundColor3 = Theme.Bg, BackgroundTransparency = 0.3, BorderSizePixel = 0,
+	}, root)
+	New("UICorner", { CornerRadius = UDim.new(1, 0) }, radar)
+	self._radarStroke = New("UIStroke", { Thickness = 1.5, Transparency = 0.4, Color = accent }, radar)
+	local inner = New("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromScale(0.5, 0.5),
+		BackgroundTransparency = 1,
+	}, radar)
+	New("UICorner", { CornerRadius = UDim.new(1, 0) }, inner)
+	New("UIStroke", { Thickness = 1, Transparency = 0.75, Color = Theme.Muted }, inner)
+	New("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.new(1, 0, 0, 1),
+		BackgroundColor3 = Theme.Muted, BackgroundTransparency = 0.8, BorderSizePixel = 0,
+	}, radar)
+	New("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.new(0, 1, 1, 0),
+		BackgroundColor3 = Theme.Muted, BackgroundTransparency = 0.8, BorderSizePixel = 0,
+	}, radar)
+	self._radarCenter = New("Frame", {
+		AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.fromOffset(7, 7),
+		BackgroundColor3 = Color3.new(1, 1, 1), BorderSizePixel = 0,
+	}, radar)
+	New("UICorner", { CornerRadius = UDim.new(1, 0) }, self._radarCenter)
+	self._radarRange = New("TextLabel", {
+		AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.new(0.5, 0, 1, -6), Size = UDim2.fromOffset(80, 12),
+		BackgroundTransparency = 1, Font = Enum.Font.GothamMedium, TextSize = 10, TextColor3 = Theme.Muted, Text = "",
+	}, radar)
+	local dots = {} :: { Frame }
+	for i = 1, 64 do -- fixed array reused every tick: radar never allocates
+		dots[i] = New("Frame", {
+			AnchorPoint = Vector2.new(0.5, 0.5), Size = UDim2.fromOffset(6, 6), BorderSizePixel = 0, Visible = false,
+		}, radar)
+		New("UICorner", { CornerRadius = UDim.new(1, 0) }, dots[i])
+	end
+	self._radar, self._radarDots, self._radarUsed = radar, dots, 0
+
+	-- Focus info card
+	local card = New("Frame", {
+		AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.new(0.5, 0, 1, -90), Size = UDim2.fromOffset(260, 62),
+		BackgroundColor3 = Theme.Bg, BackgroundTransparency = 0.2, BorderSizePixel = 0, Visible = false,
+	}, root)
+	New("UICorner", { CornerRadius = UDim.new(0, 10) }, card)
+	self._cardStroke = New("UIStroke", { Thickness = 1.5, Transparency = 0.4, Color = accent }, card)
+	self._cardName = New("TextLabel", {
+		BackgroundTransparency = 1, Position = UDim2.fromOffset(12, 6), Size = UDim2.new(1, -90, 0, 16),
+		Font = Enum.Font.GothamBold, TextSize = 14, TextColor3 = Theme.Text, TextXAlignment = Enum.TextXAlignment.Left,
+		TextTruncate = Enum.TextTruncate.AtEnd, Text = "",
+	}, card)
+	self._cardRel = New("TextLabel", {
+		AnchorPoint = Vector2.new(1, 0), BackgroundTransparency = 1, Position = UDim2.new(1, -12, 0, 6),
+		Size = UDim2.fromOffset(70, 16), Font = Enum.Font.GothamBlack, TextSize = 12, TextXAlignment = Enum.TextXAlignment.Right,
+		Text = "",
+	}, card)
+	local cardBar = New("Frame", {
+		Position = UDim2.fromOffset(12, 28), Size = UDim2.new(1, -24, 0, 8), BackgroundColor3 = Config.BarBackColor,
+		BorderSizePixel = 0,
+	}, card)
+	New("UICorner", { CornerRadius = UDim.new(0.5, 0) }, cardBar)
+	self._cardFill = New("Frame", { Size = UDim2.fromScale(1, 1), BorderSizePixel = 0 }, cardBar)
+	New("UICorner", { CornerRadius = UDim.new(0.5, 0) }, self._cardFill)
+	self._cardInfo = New("TextLabel", {
+		BackgroundTransparency = 1, Position = UDim2.fromOffset(12, 40), Size = UDim2.new(1, -24, 0, 16),
+		Font = Enum.Font.GothamMedium, TextSize = 11, TextColor3 = Theme.Muted, TextXAlignment = Enum.TextXAlignment.Left,
+		Text = "",
+	}, card)
+	self._card, self._cardPlayer, self._cardKey = card, nil, ""
+end
+
+-- Re-applies all config-driven static layout. Called from UI events only.
+function HUDManager._applyStatic(self: any)
+	if not self._ch then
+		return
+	end
+	local accent = Theme.Accent
+	local s, g, t = Config.CrosshairSize, Config.CrosshairGap, Config.CrosshairThickness
+	local c = Config.CrosshairColor
+	local a = self._chArms
+	self._ch.Visible = Config.ShowCrosshair
+	a[1].AnchorPoint, a[1].Position, a[1].Size = Vector2.new(0.5, 1), UDim2.fromOffset(0, -g), UDim2.fromOffset(t, s)
+	a[2].AnchorPoint, a[2].Position, a[2].Size = Vector2.new(0.5, 0), UDim2.fromOffset(0, g), UDim2.fromOffset(t, s)
+	a[3].AnchorPoint, a[3].Position, a[3].Size = Vector2.new(1, 0.5), UDim2.fromOffset(-g, 0), UDim2.fromOffset(s, t)
+	a[4].AnchorPoint, a[4].Position, a[4].Size = Vector2.new(0, 0.5), UDim2.fromOffset(g, 0), UDim2.fromOffset(s, t)
+	for i = 1, 4 do
+		a[i].BackgroundColor3 = c
+	end
+	self._chDot.Visible = Config.CrosshairDot
+	self._chDot.Size = UDim2.fromOffset(t + 1, t + 1)
+	self._chDot.BackgroundColor3 = c
+
+	self._ring.Visible = Config.ShowFocusRing
+	self._ring.Size = UDim2.fromOffset(Config.FocusRadius * 2, Config.FocusRadius * 2)
+	self._ringStroke.Color, self._wmStroke.Color = accent, accent
+	self._radarStroke.Color, self._cardStroke.Color = accent, accent
+	self._wm.Visible = Config.ShowWatermark
+
+	local radar = self._radar
+	local size = Config.RadarSize
+	radar.Visible = Config.ShowRadar
+	radar.Size = UDim2.fromOffset(size, size)
+	local corner = Config.RadarCorner
+	local right = corner == "TopRight" or corner == "BottomRight"
+	local bottom = corner == "BottomLeft" or corner == "BottomRight"
+	radar.AnchorPoint = Vector2.new(if right then 1 else 0, if bottom then 1 else 0)
+	radar.Position = UDim2.new(if right then 1 else 0, if right then -14 else 14, if bottom then 1 else 0, if bottom then -14 else 14)
+	self._radarRange.Text = ("%dm"):format(math.floor(Config.RadarRange * Config.StudsToMeters))
+end
+
+-- Radar: fixed dot array, throttled to 30 Hz, forward = up.
+function HUDManager._updateRadar(self: any, camera: Camera, camPos: Vector3)
+	local dots = self._radarDots :: { Frame }
+	local look = camera.CFrame.LookVector
+	local len = math.sqrt(look.X * look.X + look.Z * look.Z)
+	if len < 1e-3 then
+		return -- looking straight up/down: heading undefined, keep last frame
+	end
+	local fx, fz = look.X / len, look.Z / len
+	local rx, rz = -fz, fx
+	local R = Config.RadarSize * 0.5
+	local maxR = R - 5
+	local pxPerStud = maxR / Config.RadarRange
+	local cap = #dots
+	local used = 0
+	for _, rec in self._records do
+		local root = rec.Root
+		if root and rec.Alive and used < cap and self:_passesMode(rec.Player) then
+			local p = root.Position - camPos
+			local dx, dy = (p.X * rx + p.Z * rz) * pxPerStud, (p.X * fx + p.Z * fz) * pxPerStud
+			local m = math.sqrt(dx * dx + dy * dy)
+			local far = m > maxR
+			if far then -- out of radar range: pin to the rim, dimmed
+				dx, dy = dx / m * maxR, dy / m * maxR
+			end
+			used += 1
+			local dot = dots[used]
+			dot.Position = UDim2.fromOffset(R + dx, R - dy)
+			dot.BackgroundColor3 = self:_accentFor(rec.Player)
+			dot.BackgroundTransparency = if far then 0.65 else 0
+			dot.Visible = true
+		end
+	end
+	for i = used + 1, self._radarUsed do
+		dots[i].Visible = false
+	end
+	self._radarUsed = used
+end
+
+-- Focus card refresh (10 Hz).
+function HUDManager._updateCard(self: any, camPos: Vector3)
+	local rec = self._focusRec :: Record?
+	local card = self._card :: Frame
+	if not (Config.ShowFocusCard and rec and rec.Root and rec.Alive) then
+		card.Visible = false
+		return
+	end
+	card.Visible = true
+	local relation = self:_relation(rec.Player)
+	if rec.Player ~= self._cardPlayer then
+		self._cardPlayer = rec.Player
+		self._cardName.Text = rec.Player.DisplayName
+		self._cardKey = ""
+	end
+	local color = self:_accentFor(rec.Player)
+	self._cardRel.Text = if relation == 1 then "ALLY" elseif relation == 2 then "ENEMY" else "NEUTRAL"
+	self._cardRel.TextColor3 = color
+	self._cardFill.Size = UDim2.fromScale(rec.HealthFrac, 1)
+	self._cardFill.BackgroundColor3 = Utils.HealthColor(rec.HealthFrac)
+	local root = rec.Root :: BasePart
+	local m = math.floor((root.Position - camPos).Magnitude * Config.StudsToMeters)
+	local speed = math.floor(root.AssemblyLinearVelocity.Magnitude)
+	local hp = math.ceil(rec.Health)
+	local key = m * 1e6 + speed * 1e3 + hp -- cheap change detector: avoids string churn
+	if key ~= self._cardKey then
+		self._cardKey = key
+		self._cardInfo.Text = string.format("%dm  |  %d studs/s  |  %d/%d HP", m, speed, hp, math.ceil(rec.MaxHealth))
+	end
+end
+
+-- Per-frame update ------------------------------------------------------
+-- Hot path creates no Instances, tables, closures or Vector2s. Distance and
+-- radius tests use squared values to skip sqrt. UDim2/Color3 writes happen
+-- only for targets that survive culling.
+function HUDManager.Update(self: any, dt: number)
+	local camera = Workspace.CurrentCamera
+	if camera ~= self._camera then
+		self:_setCamera(camera)
+	end
+	if not camera then
+		return
+	end
+
+	local camCF = camera.CFrame
+	local camPos = camCF.Position
+	local cx, cy = self._cx, self._cy
+	local maxDist = Config.MaxRenderDistance
+	local maxDistSq = maxDist * maxDist
+	local radius = Config.ScreenRadius
+	local radiusSq = radius * radius
+	local useOcclusion = Config.UseOcclusion
+	local enabled = Config.Enabled
+	local showArrows = Config.ShowArrows
+	local arrowR = math.min(cx, cy) * Config.ArrowRadius
+	local fadeStep = dt / math.max(Config.FadeTime, 0.001) -- delta-time independent
+	local now = os.clock()
+	local pool, arrowPool = self._pool, self._arrowPool
+	local chamsOn = Config.ShowChams
+	local fillMul = 1 - Config.ChamsFillTransparency
+	local tracerOpacity = Config.TracerOpacity
+	local maxTags = math.min(Config.MaxActiveTags, pool:Capacity())
+	local activeCount = pool:Capacity() - pool:FreeCount()
+
+	self._k = self._vh / (2 * math.tan(math.rad(camera.FieldOfView) * 0.5))
+	local origin = Config.TracerOrigin
+	self._tracerY = if origin == "Bottom" then self._vh elseif origin == "Center" then cy else 0
+
+	self._distTimer += dt
+	self._distTick = self._distTimer >= 0.1
+	if self._distTick then
+		self._distTimer = 0
+	end
+
+	local bestSq = Config.FocusRadius * Config.FocusRadius
+	local bestRec: Record? = nil
+	local nTotal, nMode, nRange, nScreen, nRadius, nVisible, nArrows = 0, 0, 0, 0, 0, 0, 0
+
+	for _, rec in self._records do
+		local want, wantArrow = false, false
+		local vx, vy, depth, dist = 0, 0, 1, 0
+		local root = rec.Root
+		local arrowPos = Vector3.zero
+		if enabled and root and rec.Alive then
+			nTotal += 1
+			if self:_passesMode(rec.Player) then
+				nMode += 1
+				local pos = root.Position
+				local d = pos - camPos
+				local dSq = d:Dot(d)
+				if dSq <= maxDistSq then -- distance cull
+					nRange += 1
+					local vp, onScreen = camera:WorldToViewportPoint(pos)
+					if onScreen then -- frustum cull
+						nScreen += 1
+						local dx, dy = vp.X - cx, vp.Y - cy
+						local cdSq = dx * dx + dy * dy
+						if cdSq <= radiusSq then -- FOV radius cull
+							nRadius += 1
+							want = true
+							if useOcclusion then
+								want = not self:_isOccluded(rec, camPos, pos, now)
+							end
+							if want then
+								nVisible += 1
+								vx, vy, depth = vp.X, vp.Y, math.max(vp.Z, 0.1)
+								dist = math.sqrt(dSq)
+								if cdSq < bestSq then
+									bestSq, bestRec = cdSq, rec
+								end
+							end
+						end
+					elseif showArrows then
+						wantArrow, arrowPos = true, pos
+					end
+				end
+			end
+		end
+
+		-- Off-screen arrow (pooled, pinned to a ring around the screen centre)
+		if wantArrow then
+			local arrow = rec.Arrow
+			if not arrow then
+				arrow = arrowPool:Acquire()
+				rec.Arrow = arrow
+				if arrow then
+					arrow.Visible = true
+				end
+			end
+			if arrow then
+				nArrows += 1
+				local rel = camCF:PointToObjectSpace(arrowPos)
+				local ax, ay = rel.X, -rel.Y
+				local len = math.sqrt(ax * ax + ay * ay)
+				if len < 1e-3 then
+					ax, ay, len = 0, 1, 1
+				end
+				local ux, uy = ax / len, ay / len
+				arrow.Position = UDim2.fromOffset(cx + ux * arrowR, cy + uy * arrowR)
+				arrow.Rotation = math.deg(math.atan2(ux, -uy))
+				local accent = self:_accentFor(rec.Player)
+				if accent ~= rec.ArrowAccent then
+					rec.ArrowAccent = accent
+					arrow.TextColor3 = accent
+				end
+			end
+		elseif rec.Arrow then
+			self:_releaseArrow(rec)
+		end
+
+		-- Tag acquire / fade / release
+		if want then
+			if not rec.Tag and activeCount < maxTags then
+				local acquired = pool:Acquire()
+				if acquired then
+					self:_bindTag(rec, acquired)
+					activeCount += 1
+				end
+			end
+			if rec.Tag and rec.Alpha < 1 then
+				rec.Alpha = math.min(1, rec.Alpha + fadeStep)
+			end
+		elseif rec.Tag then
+			rec.Alpha = math.max(0, rec.Alpha - fadeStep)
+			if rec.Alpha <= 0 then
+				self:_releaseTag(rec)
+				activeCount -= 1
+			end
+		end
+
+		local tag = rec.Tag
+		if tag then
+			if rec.Alpha ~= rec.AppliedAlpha then
+				local a = rec.Alpha
+				rec.AppliedAlpha = a
+				tag.Group.GroupTransparency = 1 - a
+				tag.Box.GroupTransparency = 1 - a
+				tag.Tracer.BackgroundTransparency = 1 - a * tracerOpacity
+				if chamsOn then
+					tag.Chams.FillTransparency = 1 - a * fillMul
+					tag.Chams.OutlineTransparency = 1 - a
+				end
+			end
+
+			-- Damage trail: waits GhostDelay after a hit, then drains.
+			if rec.GhostFrac > rec.HealthFrac and now >= rec.GhostHold then
+				rec.GhostFrac = math.max(rec.HealthFrac, rec.GhostFrac - dt * Config.GhostDrain)
+				tag.Ghost.Size = UDim2.fromScale(rec.GhostFrac, 1)
+			end
+
+			if want then
+				self:_layout(rec, tag, vx, vy, depth, dist)
+			end
+		else
+			rec.GhostFrac = rec.HealthFrac -- nothing visible to animate
+		end
+	end
+
+	self._focusRec = bestRec
+	local stats = self._stats
+	stats.Total, stats.Mode, stats.Range, stats.Screen = nTotal, nMode, nRange, nScreen
+	stats.Radius, stats.Visible, stats.Arrows = nRadius, nVisible, nArrows
+
+	-- Throttled extras ---------------------------------------------------
+	self._radarTimer += dt
+	if self._radarTimer >= 1 / 30 then
+		self._radarTimer = 0
+		if Config.ShowRadar then
+			self:_updateRadar(camera, camPos)
+		end
+	end
+	if self._distTick then
+		self:_updateCard(camPos)
+	end
+
+	self._fpsFrames += 1
+	self._fpsTimer += dt
+	if self._fpsTimer >= 0.5 then
+		self._fps = self._fpsFrames / self._fpsTimer
+		self._fpsFrames, self._fpsTimer = 0, 0
+	end
+
+	-- Text readouts at 4 Hz (string formatting allocates)
+	self._statsTimer += dt
+	if self._statsTimer >= 0.25 then
+		self._statsTimer = 0
+		if Config.ShowWatermark then
+			self._wmLabel.Text = string.format(
+				"TACTICAL HUD   %d FPS   %d ms   %d players   %d tags",
+				math.floor(self._fps), math.floor(localPlayer:GetNetworkPing() * 1000), self._count + 1, activeCount
+			)
+		end
+		local dbg = self._debugInfo
+		if dbg and self._menu.Gui.Enabled then
+			dbg.Text = string.format(
+				"tracked   %d\npass mode %d\nin range  %d\non screen %d\nin radius %d\nvisible   %d\narrows    %d\npool free %d/%d",
+				stats.Total, stats.Mode, stats.Range, stats.Screen, stats.Radius, stats.Visible, stats.Arrows,
+				pool:FreeCount(), pool:Capacity()
+			)
+		end
+	end
+end
+
+-- Spectate / freecam ----------------------------------------------------
+function HUDManager.Spectate(self: any, player: Player?)
+	self._specJanitor:Clean()
+	local camera = Workspace.CurrentCamera
+	if not camera then
+		return
+	end
+	if self._freecam then
+		self:SetFreecam(false)
+	end
+	if not player then
+		self._specPlayer = nil
+		local char = localPlayer.Character
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		if hum then
+			camera.CameraSubject = hum
+		end
+	else
+		self._specPlayer = player
+		local function follow(char: Model?)
+			local hum = char and char:FindFirstChildOfClass("Humanoid")
+			if hum then
+				camera.CameraSubject = hum
+			end
+		end
+		follow(player.Character)
+		self._specJanitor:Add(player.CharacterAdded:Connect(function(char)
+			local hum = char:WaitForChild("Humanoid", 10) :: Humanoid?
+			if hum and self._specPlayer == player and not self._destroyed then
+				camera.CameraSubject = hum
+			end
+		end))
+	end
+	self:_playersChanged()
+	if self._menu then
+		self._menu.Refresh()
+	end
+end
+
+function HUDManager._specCycle(self: any, dir: number)
+	local list = {} :: { Player }
+	for _, p in Players:GetPlayers() do
+		if p ~= localPlayer then
+			table.insert(list, p)
+		end
+	end
+	if #list == 0 then
+		return
+	end
+	local idx = table.find(list, self._specPlayer :: any) or 0
+	if idx == 0 and dir < 0 then
+		idx = 1
+	end
+	self:Spectate(list[(idx - 1 + dir) % #list + 1])
+end
+
+function HUDManager._freecamStep(self: any, dt: number)
+	local camera = Workspace.CurrentCamera
+	if not camera then
+		return
+	end
+	local rot = CFrame.fromOrientation(self._fcPitch, self._fcYaw, 0)
+	local move = Vector3.zero
+	local key = UserInputService.IsKeyDown
+	if key(UserInputService, Enum.KeyCode.W) then move += Vector3.new(0, 0, -1) end
+	if key(UserInputService, Enum.KeyCode.S) then move += Vector3.new(0, 0, 1) end
+	if key(UserInputService, Enum.KeyCode.A) then move += Vector3.new(-1, 0, 0) end
+	if key(UserInputService, Enum.KeyCode.D) then move += Vector3.new(1, 0, 0) end
+	local up = 0
+	if key(UserInputService, Enum.KeyCode.E) or key(UserInputService, Enum.KeyCode.Space) then up += 1 end
+	if key(UserInputService, Enum.KeyCode.Q) then up -= 1 end
+	local speed = Config.FreecamSpeed
+	if key(UserInputService, Enum.KeyCode.LeftShift) then speed *= 3 end
+	if key(UserInputService, Enum.KeyCode.LeftControl) then speed *= 0.25 end
+	self._fcPos += (rot:VectorToWorldSpace(move) + Vector3.new(0, up, 0)) * speed * dt
+	camera.CFrame = CFrame.new(self._fcPos) * rot
+end
+
+function HUDManager.SetFreecam(self: any, on: boolean)
+	if on == self._freecam then
+		return
+	end
+	local camera = Workspace.CurrentCamera
+	if not camera then
+		return
+	end
+	if on then
+		if self._specPlayer then
+			self:Spectate(nil)
+		end
+		local cf = camera.CFrame
+		self._fcPitch, self._fcYaw = cf:ToOrientation()
+		self._fcPos = cf.Position
+		self._fcSavedType = camera.CameraType
+		camera.CameraType = Enum.CameraType.Scriptable
+		-- Sink movement keys so the character doesn't walk while flying the camera.
+		ContextActionService:BindActionAtPriority("TacticalHUD_FreecamSink", function()
+			return Enum.ContextActionResult.Sink
+		end, false, Enum.ContextActionPriority.High.Value,
+			Enum.KeyCode.W, Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.D, Enum.KeyCode.Q, Enum.KeyCode.E,
+			Enum.KeyCode.Space, Enum.KeyCode.LeftShift)
+		RunService:BindToRenderStep("TacticalHUD_Freecam", Enum.RenderPriority.Camera.Value, function(dt)
+			self:_freecamStep(dt)
+		end)
+		self._freecam = true
+	else
+		self._freecam = false
+		RunService:UnbindFromRenderStep("TacticalHUD_Freecam")
+		ContextActionService:UnbindAction("TacticalHUD_FreecamSink")
+		camera.CameraType = self._fcSavedType
+		UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+	end
+	if self._menu then
+		self._menu.Refresh()
+	end
+end
+
+-- Menu ------------------------------------------------------------------
+function HUDManager._resetDefaults(self: any)
+	for k, v in Defaults do
+		(Config :: any)[k] = v
+	end
+	self:_syncMenuTheme()
+end
+
+function HUDManager._syncMenuTheme(self: any)
+	local m = self._menu
+	m.SetAccent(Config.Accent)
+	m.SetScale(Config.MenuScale)
+	m.SetOpacity(Config.MenuOpacity)
+	self:_invalidate()
+	m.Refresh()
+end
+
+function HUDManager._buildMenu(self: any)
+	local menu = createMenu(self._janitor, function()
+		self:_invalidate()
+	end)
+	self._menu = menu
+	local function cfgToggle(tab: any, label: string, key: string)
+		tab.Toggle(label, function()
+			return (Config :: any)[key]
+		end, function(v: boolean)
+			(Config :: any)[key] = v
+		end)
+	end
+	local function cfgSlider(tab: any, label: string, key: string, min: number, max: number, opts: any?)
+		tab.Slider(label, min, max, function()
+			return (Config :: any)[key]
+		end, function(v: number)
+			(Config :: any)[key] = v
+		end, opts)
+	end
+	local function cfgCycle(tab: any, label: string, key: string, options: { string })
+		tab.Cycle(label, options, function()
+			return (Config :: any)[key]
+		end, function(v: string)
+			(Config :: any)[key] = v
+		end)
+	end
+	local function cfgColor(tab: any, label: string, key: string)
+		tab.Swatches(label, function()
+			return (Config :: any)[key]
+		end, function(c: Color3)
+			(Config :: any)[key] = c
+		end)
+	end
+	local function cfgKey(tab: any, label: string, key: string)
+		tab.Keybind(label, function()
+			return (Config :: any)[key]
+		end, function(k: Enum.KeyCode)
+			(Config :: any)[key] = k
+		end)
+	end
+	local meters = function(v: number)
+		return ("%d m"):format(math.floor(v * Config.StudsToMeters))
+	end
+	local studs = function(v: number)
+		return ("%d studs"):format(math.floor(v))
+	end
+	local px = function(v: number)
+		return ("%d px"):format(math.floor(v))
+	end
+
+	-- VISUALS ------------------------------------------------------------
+	local vis = menu.AddTab("Visuals")
+	vis.Section("Targets")
+	cfgToggle(vis, "HUD enabled", "Enabled")
+	cfgCycle(vis, "Mode", "Mode", { "All", "Teammates" })
+	cfgToggle(vis, "Teamless counts as ally", "NeutralCountsAsTeam")
+	vis.Section("ESP")
+	cfgToggle(vis, "Boxes", "ShowBoxes")
+	cfgCycle(vis, "Box style", "BoxStyle", { "Corners", "Full" })
+	cfgToggle(vis, "Tracers", "ShowTracers")
+	cfgCycle(vis, "Tracer origin", "TracerOrigin", { "Bottom", "Center", "Top" })
+	cfgToggle(vis, "Names", "ShowNames")
+	cfgToggle(vis, "Health bars", "ShowHealth")
+	cfgToggle(vis, "Distance", "ShowDistance")
+	cfgToggle(vis, "Chams (highlight)", "ShowChams")
+	cfgSlider(vis, "Chams fill transparency", "ChamsFillTransparency", 0, 1, { Step = 0.05 })
+	cfgToggle(vis, "Off-screen arrows", "ShowArrows")
+	vis.Section("Culling & detail")
+	cfgSlider(vis, "Max range", "MaxRenderDistance", Config.MinRenderDistance, Config.MaxRenderDistanceCap, { Log = true, Step = 10, Format = studs })
+	cfgSlider(vis, "Screen radius", "ScreenRadius", Config.MinScreenRadius, Config.MaxScreenRadius, { Step = 50, Format = px })
+	cfgSlider(vis, "Full detail within", "NearDetailDistance", 50, 2000, { Step = 10, Format = studs })
+	cfgSlider(vis, "Name + distance within", "MidDetailDistance", 200, 10000, { Log = true, Step = 50, Format = studs })
+	cfgToggle(vis, "Occlusion raycast", "UseOcclusion")
+	vis.Section("Colors")
+	cfgColor(vis, "Ally", "AllyColor")
+	cfgColor(vis, "Enemy", "EnemyColor")
+	cfgColor(vis, "Neutral", "NeutralColor")
+	cfgColor(vis, "Focus", "FocusColor")
+
+	-- OVERLAY ------------------------------------------------------------
+	local ov = menu.AddTab("Overlay")
+	ov.Section("Radar")
+	cfgToggle(ov, "Radar", "ShowRadar")
+	cfgSlider(ov, "Size", "RadarSize", 100, 320, { Step = 10, Format = px })
+	cfgSlider(ov, "Range", "RadarRange", 50, 5000, { Log = true, Step = 10, Format = studs })
+	cfgCycle(ov, "Corner", "RadarCorner", { "TopLeft", "TopRight", "BottomLeft", "BottomRight" })
+	ov.Section("Crosshair")
+	cfgToggle(ov, "Crosshair", "ShowCrosshair")
+	cfgSlider(ov, "Arm length", "CrosshairSize", 2, 30, { Step = 1, Format = px })
+	cfgSlider(ov, "Gap", "CrosshairGap", 0, 20, { Step = 1, Format = px })
+	cfgSlider(ov, "Thickness", "CrosshairThickness", 1, 6, { Step = 1, Format = px })
+	cfgToggle(ov, "Center dot", "CrosshairDot")
+	cfgColor(ov, "Color", "CrosshairColor")
+	ov.Section("Info")
+	cfgToggle(ov, "Watermark (FPS / ping)", "ShowWatermark")
+	cfgToggle(ov, "Focus card", "ShowFocusCard")
+	cfgToggle(ov, "Focus ring", "ShowFocusRing")
+	cfgSlider(ov, "Focus radius", "FocusRadius", 40, 600, { Step = 10, Format = px })
+
+	-- SPECTATE -----------------------------------------------------------
+	local sp = menu.AddTab("Spectate")
+	sp.Section("Target")
+	sp.Info(30, function()
+		local p = self._specPlayer
+		return if p then ("Spectating: %s (@%s)"):format(p.DisplayName, p.Name) elseif self._freecam then "Freecam active" else "Not spectating"
+	end)
+	local listRow = sp.Container(150)
+	local list = New("ScrollingFrame", {
+		Position = UDim2.fromOffset(6, 6), Size = UDim2.new(1, -12, 1, -12), BackgroundTransparency = 1, BorderSizePixel = 0,
+		ScrollBarThickness = 3, AutomaticCanvasSize = Enum.AutomaticSize.Y, CanvasSize = UDim2.new(),
+	}, listRow)
+	New("UIListLayout", { Padding = UDim.new(0, 3), SortOrder = Enum.SortOrder.Name }, list)
+	self._rebuildList = function()
+		for _, child in list:GetChildren() do
+			if child:IsA("TextButton") then
+				child:Destroy()
+			end
+		end
+		for _, p in Players:GetPlayers() do
+			if p ~= localPlayer then
+				local on = self._specPlayer == p
+				local b = New("TextButton", {
+					Name = p.DisplayName:lower() .. p.UserId, Size = UDim2.new(1, 0, 0, 26),
+					BackgroundColor3 = if on then Theme.Accent else Theme.Off, BackgroundTransparency = if on then 0.6 else 0,
+					BorderSizePixel = 0, Font = Enum.Font.GothamMedium, TextSize = 12, TextColor3 = Theme.Text,
+					TextXAlignment = Enum.TextXAlignment.Left, Text = ("  %s  (@%s)"):format(p.DisplayName, p.Name),
+					AutoButtonColor = true,
+				}, list)
+				New("UICorner", { CornerRadius = UDim.new(0, 6) }, b)
+				b.Activated:Connect(function()
+					self:Spectate(p)
+					menu.Toast("Spectating " .. p.DisplayName)
+				end)
+			end
+		end
+	end
+	self._rebuildList()
+	sp.Button("Spectate player under crosshair", function()
+		local rec = self._focusRec :: Record?
+		if rec then
+			self:Spectate(rec.Player)
+			menu.Toast("Spectating " .. rec.Player.DisplayName)
+		else
+			menu.Toast("No target in focus")
+		end
+	end)
+	sp.Button("Previous player", function()
+		self:_specCycle(-1)
+	end)
+	sp.Button("Next player", function()
+		self:_specCycle(1)
+	end)
+	sp.Button("Stop spectating", function()
+		self:Spectate(nil)
+		menu.Toast("Camera restored")
+	end)
+	sp.Section("Freecam")
+	sp.Toggle("Freecam (WASD, Q/E, Shift = fast, RMB = look)", function()
+		return self._freecam
+	end, function(v: boolean)
+		self:SetFreecam(v)
+	end)
+	cfgSlider(sp, "Speed", "FreecamSpeed", 10, 400, { Log = true, Step = 5, Format = function(v: number)
+		return ("%d studs/s"):format(math.floor(v))
+	end })
+	sp.Button("Freecam to player under crosshair", function()
+		local rec = self._focusRec :: Record?
+		local cam = Workspace.CurrentCamera
+		if rec and rec.Root and cam then
+			self:SetFreecam(true)
+			local root = rec.Root :: BasePart
+			local back = (cam.CFrame.Position - root.Position)
+			back = if back.Magnitude > 1e-3 then back.Unit else Vector3.new(0, 0, 1)
+			self._fcPos = root.Position + back * 14 + Vector3.new(0, 4, 0)
+			self._fcPitch, self._fcYaw = CFrame.lookAt(self._fcPos, root.Position):ToOrientation()
+		else
+			menu.Toast("No target in focus")
+		end
+	end)
+
+	-- MISC ---------------------------------------------------------------
+	local misc = menu.AddTab("Misc")
+	misc.Section("Performance")
+	cfgSlider(misc, "Max active tags", "MaxActiveTags", 1, Config.PoolSize, { Step = 1 })
+	cfgSlider(misc, "Fade time", "FadeTime", 0.05, 1, { Step = 0.05, Format = function(v: number)
+		return ("%.2fs"):format(v)
+	end })
+	cfgSlider(misc, "Damage trail delay", "GhostDelay", 0, 1.5, { Step = 0.05, Format = function(v: number)
+		return ("%.2fs"):format(v)
+	end })
+	cfgSlider(misc, "Box width", "BoxWidthStuds", 1, 8, { Step = 0.1, Format = studs })
+	cfgSlider(misc, "Box height", "BoxHeightStuds", 2, 12, { Step = 0.1, Format = studs })
+	cfgSlider(misc, "Arrow ring size", "ArrowRadius", 0.4, 0.95, { Step = 0.01 })
+	misc.Section("Culling counters (live)")
+	self._debugInfo = misc.Info(124)
+	misc.Section("Tools")
+	misc.Button("Print counters to output", function()
+		local s = self._stats
+		print(("[TacticalHUD] tracked=%d mode=%d range=%d screen=%d radius=%d visible=%d arrows=%d pool=%d/%d"):format(
+			s.Total, s.Mode, s.Range, s.Screen, s.Radius, s.Visible, s.Arrows,
+			self._pool:Capacity() - self._pool:FreeCount(), self._pool:Capacity()))
+		menu.Toast("Printed to output")
+	end)
+
+	-- SETTINGS -----------------------------------------------------------
+	local set = menu.AddTab("Settings")
+	set.Section("Presets")
+	local presetIndex = 1
+	local names = {} :: { string }
+	for _, p in Presets do
+		table.insert(names, p.Name)
+	end
+	set.Cycle("Preset", names, function()
+		return names[presetIndex]
+	end, function(n: string)
+		presetIndex = table.find(names, n) or 1
+	end)
+	set.Button("Apply preset", function()
+		for k, v in Presets[presetIndex].Values do
+			(Config :: any)[k] = v
+		end
+		self:_invalidate()
+		menu.Refresh()
+		menu.Toast("Applied: " .. names[presetIndex])
+	end)
+	set.Section("Theme")
+	set.Swatches("Accent", function()
+		return Config.Accent
+	end, function(c: Color3)
+		Config.Accent = c
+		menu.SetAccent(c)
+	end)
+	cfgSlider(set, "Menu scale", "MenuScale", 0.7, 1.4, { Step = 0.05, Format = function(v: number)
+		return ("%d%%"):format(math.floor(v * 100 + 0.5))
+	end })
+	cfgSlider(set, "Menu transparency", "MenuOpacity", 0, 0.5, { Step = 0.02, Format = function(v: number)
+		return ("%d%%"):format(math.floor(v * 200 + 0.5))
+	end })
+	set.Section("Keybinds (click, then press a key)")
+	cfgKey(set, "Toggle HUD", "ToggleHudKey")
+	cfgKey(set, "Toggle menu", "ToggleMenuKey")
+	cfgKey(set, "Spectate next", "SpectateNextKey")
+	cfgKey(set, "Spectate previous", "SpectatePrevKey")
+	cfgKey(set, "Toggle freecam", "FreecamKey")
+	set.Section("Danger zone")
+	set.Button("Reset everything to defaults", function()
+		self:_resetDefaults()
+		menu.Toast("Defaults restored")
+	end)
+	set.Button("Unload HUD", function()
+		self:Destroy()
+	end, true)
+
+	-- Menu scale/opacity sliders feed straight into the window.
+	local baseOnChange = menu.Refresh
+	menu.Register(function()
+		menu.SetScale(Config.MenuScale)
+		menu.SetOpacity(Config.MenuOpacity)
+	end)
+	return baseOnChange
+end
+
+-- Lifecycle -------------------------------------------------------------
+function HUDManager.Start(self: any)
+	local j = self._janitor
+
+	-- Keep our own character out of occlusion rays; stop spectating on respawn
+	-- (the default camera script resets the subject anyway).
+	local function onLocalChar(char: Model?)
+		self._rayParams.FilterDescendantsInstances = if char then { char } else {}
+		if self._specPlayer then
+			self._specPlayer = nil
+			self._specJanitor:Clean()
+			self:_playersChanged()
+		end
+	end
+	onLocalChar(localPlayer.Character)
+	j:Add(localPlayer.CharacterAdded:Connect(onLocalChar))
+
+	self:_buildStatic()
+	self:_buildMenu()
+	self:_applyStatic()
+
+	j:Add(Players.PlayerAdded:Connect(function(p)
+		self:_addPlayer(p)
+	end))
+	j:Add(Players.PlayerRemoving:Connect(function(p)
+		self:_removePlayer(p)
+	end))
+	for _, p in Players:GetPlayers() do
+		self:_addPlayer(p)
+	end
+
+	local menu = self._menu
+	j:Add(UserInputService.InputBegan:Connect(function(input, processed)
+		if menu.HandleKey(input) then
+			return
+		end
+		if self._freecam and input.UserInputType == Enum.UserInputType.MouseButton2 then
+			UserInputService.MouseBehavior = Enum.MouseBehavior.LockCurrentPosition
+		end
+		if processed or input.UserInputType ~= Enum.UserInputType.Keyboard then
+			return
+		end
+		local k = input.KeyCode
+		if k == Config.ToggleHudKey then
+			Config.Enabled = not Config.Enabled
+			menu.Refresh()
+		elseif k == Config.ToggleMenuKey then
+			menu.Toggle()
+		elseif k == Config.SpectateNextKey then
+			self:_specCycle(1)
+		elseif k == Config.SpectatePrevKey then
+			self:_specCycle(-1)
+		elseif k == Config.FreecamKey then
+			self:SetFreecam(not self._freecam)
+		end
+	end))
+	j:Add(UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton2 and self._freecam then
+			UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+		end
+	end))
+	j:Add(UserInputService.InputChanged:Connect(function(input)
+		if self._freecam and input.UserInputType == Enum.UserInputType.MouseMovement
+			and UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then
+			self._fcYaw -= input.Delta.X * 0.003
+			self._fcPitch = math.clamp(self._fcPitch - input.Delta.Y * 0.003, -1.5, 1.5)
+		end
+	end))
+
+	-- Camera priority + 1: runs after the camera moved this frame, so
+	-- projected positions match what is rendered.
+	RunService:BindToRenderStep("TacticalHUD", Enum.RenderPriority.Camera.Value + 1, function(dt)
+		self:Update(dt)
+	end)
+end
+
+function HUDManager.Destroy(self: any)
+	if self._destroyed then
+		return
+	end
+	self._destroyed = true
+	RunService:UnbindFromRenderStep("TacticalHUD")
+	if self._freecam then
+		self:SetFreecam(false)
+	end
+	self._specJanitor:Clean()
+	self._janitor:Clean()
+	self._camJanitor:Clean()
+	for player in self._records do
+		self:_removePlayer(player)
+	end
+	self._pool:Destroy()
+	self._arrowPool:Destroy()
+	self._folder:Destroy()
+	self._overlay:Destroy()
+	self._static:Destroy()
+	if self._menu then
+		self._menu.Destroy()
+	end
+end
+
+----------------------------------------------------------------------
+-- MAIN LOOP
+----------------------------------------------------------------------
+local manager = HUDManager.new()
+manager:Start()
+
+script.Destroying:Connect(function()
+	manager:Destroy()
+end)

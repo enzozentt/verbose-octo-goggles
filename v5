@@ -1,6 +1,6 @@
 --!nonstrict
 --[[
-	Festering Felix (v17)
+	Festering Felix (v20)
 	Player ESP + radar + lock-on assist + spectate tools + FOV / fullbright / FPS booster, with a minimal menu.
 	Place as a LocalScript in StarterPlayer > StarterPlayerScripts.
 
@@ -100,6 +100,7 @@ local Config = {
 	CycleSpeed = 0.05,
 	Filter = "Off", -- "Off" | "Warm" | "Cool" | "Noir" | "Vivid" | "Night"
 	FilterAmount = 0.6,
+	Vibrancy = 0, -- -1 (washed out) .. 0 (as the game made it) .. 1 (very vivid)
 	Bloom = false,
 	BloomAmount = 0.6,
 	SunRays = false,
@@ -316,6 +317,17 @@ end
 
 local function isBodyPart(p)
 	return p.Name ~= "Handle" and p:FindFirstAncestorWhichIsA("Accessory") == nil and p:FindFirstAncestorWhichIsA("Tool") == nil
+end
+
+-- First ValueBase with this name anywhere under inst. (FindFirstChild(name, true) can return an
+-- unrelated Script or Folder that happens to be called "Health" and hide the real value.)
+local function findValue(inst, name)
+	for _, d in inst:GetDescendants() do
+		if d.Name == name and d:IsA("ValueBase") then
+			return d
+		end
+	end
+	return nil
 end
 
 local function healthColor(f)
@@ -561,6 +573,7 @@ function HUD:_rebuild()
 	self.stats.rebuilds += 1
 	for _, rec in self.list do
 		rec.Tag, rec.Arrow, rec.Skel, rec.Applied = nil, nil, nil, nil
+		rec.ArrowColor, rec.ArrowClose = nil, nil -- the new arrows start at the default size/colour
 	end
 	for _, inst in { self.overlay, self.hudGui, self.chamFolder } do
 		pcall(function()
@@ -813,8 +826,15 @@ function HUD:_bind(rec, character, force)
 			end
 		end))
 		self.teamIds[rec.Player] = self:_computeTeam(rec.Player, character) -- before anything can draw
-		self:_setupHealth(rec, character, hum)
-		self:_scan(rec)
+		-- guarded: an odd rig must never leave a half-bound target (the rescan repairs the rest)
+		local okH, eH = pcall(self._setupHealth, self, rec, character, hum)
+		if not okH then
+			self:_err("health setup", eH)
+		end
+		local okS, eS = pcall(self._scan, self, rec)
+		if not okS then
+			self:_err("rig scan", eS)
+		end
 		rec.Info = ("root=%s head=%s health=%s"):format(root.Name, head and head.Name or "estimated", rec.HealthSource)
 	end)
 end
@@ -877,8 +897,8 @@ function HUD:_healthCandidates(p, ch, hum)
 		end
 	end
 	for _, hn in RigConfig.HealthValueNames do
-		local hv = ch:FindFirstChild(hn, true) or p:FindFirstChild(hn, true)
-		if hv and hv:IsA("ValueBase") and type(hv.Value) == "number" then
+		local hv = findValue(ch, hn) or findValue(p, hn)
+		if hv and type(hv.Value) == "number" then
 			local mv
 			for _, mn in RigConfig.MaxHealthValueNames do
 				local c = hv.Parent and hv.Parent:FindFirstChild(mn)
@@ -955,11 +975,20 @@ function HUD:_setupHealth(rec, ch, hum)
 		else -- 0.25 s grace so one bad read can't blink the ESP
 			rec.DeadSince = rec.DeadSince or os.clock()
 			rec.Alive = os.clock() - rec.DeadSince < 0.25
+			if rec.Alive then
+				-- nothing else would re-read a dead target until the 1 s safety net, so confirm shortly
+				task.delay(0.3, function()
+					if rec.Refresh == refresh then
+						refresh()
+					end
+				end)
+			end
 		end
 		rec.LastDistM = -1
 		if rec.Tag then
 			rec.Tag.Hp.Size = UDim2.fromScale(frac, 1)
 			rec.Tag.Hp.BackgroundColor3 = healthColor(frac)
+			rec.Tag.Ghost.Size = UDim2.fromScale(math.max(rec.Ghost, frac), 1) -- no stale trail after a heal
 		end
 	end
 	rec.Refresh = refresh
@@ -1331,8 +1360,8 @@ end
 
 function HUD:_updateRec(rec, c)
 	local root = rec.Root
-	if not (c.show and root and rec.Alive and rec.InWorld) or self:_blocked(rec.Player) then
-		return self:_hide(rec)
+	if not (c.show and root and rec.Alive and rec.InWorld) or rec.Player == self.specPlayer or self:_blocked(rec.Player) then
+		return self:_hide(rec) -- (the player you're spectating is the camera, not a target)
 	end
 	if not root.Parent then
 		rec.NextScan = 0 -- parts were swapped (round reset): re-check this target next
@@ -1709,15 +1738,13 @@ function HUD:Update(dt)
 			self.fovOrig = camera.FieldOfView
 			self.fovCur = self.fovOrig
 		end
-		-- fovCur is the "virtual" FOV and may exceed 120. The real camera FOV is capped at 120
-		-- (Roblox's hard limit); the excess is shown by pulling the camera back (_applyWide).
-		self.fovCur += (math.clamp(wantFov, 5, 200) - self.fovCur) * (1 - math.exp(-14 * dt))
-		self.fovTarget = math.min(self.fovCur, 120)
-		setFov(self.fovTarget)
+		self.fovCur += (math.clamp(wantFov, 5, 120) - self.fovCur) * (1 - math.exp(-14 * dt))
+		self.fovTarget = self.fovCur
+		setFov(self.fovCur)
 	elseif self.fovCur then
 		self.fovCur += (self.fovOrig - self.fovCur) * (1 - math.exp(-14 * dt))
-		self.fovTarget = math.min(self.fovCur, 120)
-		setFov(self.fovTarget)
+		self.fovTarget = self.fovCur
+		setFov(self.fovCur)
 		if math.abs(self.fovCur - self.fovOrig) < 0.3 then
 			self.fovTarget = nil
 			setFov(self.fovOrig)
@@ -1734,10 +1761,6 @@ function HUD:Update(dt)
 	local okLock, eLock = pcall(self._applyLock, self, camera, dt)
 	if not okLock then
 		self:_err("lock-on", eLock)
-	end
-	local okWide, eWide = pcall(self._applyWide, self, camera)
-	if not okWide then
-		self:_err("wide view", eWide)
 	end
 
 	-- the overlay's AbsoluteSize is the real screen size and never goes stale
@@ -1807,9 +1830,14 @@ function HUD:Update(dt)
 	self.slowTimer += dt
 	if self.slowTimer >= 1 then
 		self.slowTimer = 0
-		self:_refreshTeams()
-		self:_lighting() -- games that rewrite Lighting get corrected again every second
-		self:_applyZoomOut()
+		-- once a second: team ids, lighting (games that rewrite Lighting get corrected again), our
+		-- post-effects (recreated if a round cleanup deleted them) and the extended zoom-out
+		for _, fn in { self._refreshTeams, self._lighting, self._post, self._applyZoomOut } do
+			local okW, eW = pcall(fn, self)
+			if not okW then
+				self:_err("world", eW)
+			end
+		end
 		local okh, eh = pcall(self._heal, self)
 		if not okh then
 			self:_err("heal", eh)
@@ -2221,7 +2249,7 @@ local Tips = {
 	["Skip teammates"] = "Never lock onto teammates",
 	["Threat readout"] = "Small counter at the top: players in range and the nearest distance",
 	["FOV changer"] = "Overrides the game's field of view every frame. Switching it off restores the original",
-	["Field of view"] = "Degrees; default is 70. Roblox caps real FOV at 120, so above that the camera also pulls back to fake a wider lens",
+	["Field of view"] = "Degrees; the default is 70 and Roblox caps it at 120",
 	["Fullbright"] = "Removes darkness, fog and shadows. Switching it off restores the game's lighting",
 	["Hold to zoom"] = "Hold the zoom key to ease into a narrow FOV; release to ease back",
 	["Zoom key"] = "Click, then press a key or a mouse button. Esc cancels",
@@ -2234,6 +2262,7 @@ local Tips = {
 	["Sky tint"] = "Tints the sky and horizon haze. A custom skybox image keeps its picture but takes the tint",
 	["Color cycle"] = "Fog and sky slowly cycle through colours",
 	["Screen filter"] = "A colour grade over the whole screen",
+	["Vibrancy"] = "Pushes colours toward vivid (right) or washed out (left). Works on its own or on top of a filter. Right-click to reset",
 	["Bloom"] = "Soft glow around bright areas",
 	["Sun rays"] = "Light shafts from the sun",
 	["FPS booster"] = "Strips textures and flattens materials locally. Switching it off restores everything",
@@ -2312,7 +2341,7 @@ local function createMenu(jan, onChange)
 	}, bar)
 	New("TextLabel", {
 		Position = UDim2.fromOffset(150, 2), Size = UDim2.new(0, 60, 1, 0), BackgroundTransparency = 1, Font = FONT, TextSize = 12,
-		TextColor3 = Theme.Off, TextXAlignment = Enum.TextXAlignment.Left, Text = "v17",
+		TextColor3 = Theme.Off, TextXAlignment = Enum.TextXAlignment.Left, Text = "v20",
 	}, bar)
 	local close = New("TextButton", {
 		AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -10, 0.5, 0), Size = UDim2.fromOffset(26, 26), BackgroundTransparency = 1,
@@ -3101,7 +3130,7 @@ function HUD:_buildMenu()
 	end
 	wd.Section("Camera")
 	cfgToggle(wd, "FOV changer", "FovOn")
-	cfgSlider(wd, "Field of view", "Fov", 30, 200, { step = 1, format = deg })
+	cfgSlider(wd, "Field of view", "Fov", 30, 120, { step = 1, format = deg })
 	cfgToggle(wd, "Hold to zoom", "ZoomOn")
 	wd.Bind("Zoom key", function() return Config.ZoomKey end, function(b) Config.ZoomKey = b end, true)
 	cfgSlider(wd, "Zoom FOV", "ZoomFov", 5, 60, { step = 1, format = deg })
@@ -3126,6 +3155,9 @@ function HUD:_buildMenu()
 	wd.Section("Filters")
 	cfgSegment(wd, "Screen filter", "Filter", { "Off", "Warm", "Cool", "Noir", "Vivid", "Night" })
 	cfgSlider(wd, "Filter strength", "FilterAmount", 0, 1, { step = 0.05, format = pct })
+	cfgSlider(wd, "Vibrancy", "Vibrancy", -1, 1, { step = 0.05, format = function(v)
+		return (v > 0 and "+" or "") .. math.floor(v * 100 + 0.5) .. "%"
+	end })
 	cfgToggle(wd, "Bloom", "Bloom")
 	cfgSlider(wd, "Bloom strength", "BloomAmount", 0.1, 2, { step = 0.1 })
 	cfgToggle(wd, "Sun rays", "SunRays")
@@ -3252,7 +3284,7 @@ end
 
 function HUD:_lightingRestore()
 	local s = self.lightSaved
-	self.lightSaved = nil
+	self.lightSaved, self.lightMine, self.atmosTouched, self.skyTouched = nil, nil, nil, nil
 	if self.ownAtmos then
 		self.ownAtmos:Destroy()
 		self.ownAtmos = nil
@@ -3301,6 +3333,7 @@ function HUD:_lighting()
 			end
 		end
 		self.lightSaved = s
+		self.lightMine = {}
 	end
 	local s = self.lightSaved
 
@@ -3311,52 +3344,73 @@ function HUD:_lighting()
 		fogColor, skyColor, fogOn, skyOn = c, c, true, true
 	end
 
-	local brightness, ambient, outdoor, exposure = s.Brightness, s.Ambient, s.OutdoorAmbient, s.ExposureCompensation
-	local shadows, clock, fogStart, fogEnd = s.GlobalShadows, s.ClockTime, s.FogStart, s.FogEnd
+	-- Only the properties a feature actually overrides are written, so everything else stays under
+	-- the game's control (day/night cycle, zone lighting...). A property we stop overriding is put
+	-- back to its snapshot value once, then left alone again.
+	local ov = {}
 	local clearHaze = false
 	if Config.Fullbright then
-		brightness, ambient, outdoor, exposure = 2, Color3.fromRGB(170, 170, 170), Color3.fromRGB(170, 170, 170), 0
-		shadows, clock, fogStart, fogEnd, clearHaze = false, 14, 0, 1000000, true
+		ov.Brightness, ov.Ambient, ov.OutdoorAmbient, ov.ExposureCompensation = 2, Color3.fromRGB(170, 170, 170), Color3.fromRGB(170, 170, 170), 0
+		ov.GlobalShadows, ov.ClockTime, ov.FogStart, ov.FogEnd = false, 14, 0, 1000000
+		clearHaze = true
 	end
-	if Config.NoShadows then
-		shadows = false
+	if Config.NoShadows or self.boostShadows ~= nil then
+		ov.GlobalShadows = false -- (the FPS booster's Max level also wants shadows off)
 	end
 	if Config.LockTime then
-		clock = Config.TimeOfDay
+		ov.ClockTime = Config.TimeOfDay
 	end
 	local fogDensity = math.clamp(220 / math.max(Config.FogDistance, 10), 0.05, 0.95)
 	if fogOn then
-		fogStart, fogEnd = 0, Config.FogDistance
+		ov.FogColor, ov.FogStart, ov.FogEnd = fogColor, 0, Config.FogDistance
+	end
+	if skyOn then
+		ov.ColorShift_Top, ov.ColorShift_Bottom = skyColor, skyColor:Lerp(WHITE, 0.35)
+	end
+	local mine = self.lightMine
+	for _, p in LIGHT_PROPS do
+		local v = ov[p]
+		if v ~= nil then
+			if Lighting[p] ~= v then
+				Lighting[p] = v
+			end
+			mine[p] = true
+		elseif mine[p] then
+			Lighting[p] = s[p]
+			mine[p] = nil
+		end
 	end
 
-	Lighting.Brightness, Lighting.Ambient, Lighting.OutdoorAmbient = brightness, ambient, outdoor
-	Lighting.ExposureCompensation, Lighting.GlobalShadows, Lighting.ClockTime = exposure, shadows, clock
-	Lighting.FogStart, Lighting.FogEnd = fogStart, fogEnd
-	Lighting.FogColor = fogOn and fogColor or s.FogColor
-	Lighting.ColorShift_Top = skyOn and skyColor or s.ColorShift_Top
-	Lighting.ColorShift_Bottom = skyOn and skyColor:Lerp(WHITE, 0.35) or s.ColorShift_Bottom
-
 	-- Atmosphere (newer places ignore plain fog and use this instead)
+	local atmosActive = fogOn or skyOn or clearHaze
+	local restoringAtmos = not atmosActive and self.atmosTouched
 	local hasAtmos = false
 	for a, base in s.atmos do
 		if a.Parent then
 			hasAtmos = true
-			local density, haze, color, decay = base.Density, base.Haze, base.Color, base.Decay
-			if clearHaze then
-				density, haze = 0, 0
-			end
-			if fogOn then
-				density, color, haze = fogDensity, fogColor, math.max(haze, 1)
-			end
-			if skyOn then
-				decay = skyColor
-				if not fogOn then
-					color = skyColor:Lerp(WHITE, 0.5)
+			if atmosActive then
+				local density, haze, color, decay = base.Density, base.Haze, base.Color, base.Decay
+				if clearHaze then
+					density, haze = 0, 0
+				end
+				if fogOn then
+					density, color, haze = fogDensity, fogColor, math.max(haze, 1)
+				end
+				if skyOn then
+					decay = skyColor
+					if not fogOn then
+						color = skyColor:Lerp(WHITE, 0.5)
+					end
+				end
+				a.Density, a.Haze, a.Color, a.Decay = density, haze, color, decay
+			elseif restoringAtmos then
+				for k, v in base do
+					a[k] = v
 				end
 			end
-			a.Density, a.Haze, a.Color, a.Decay = density, haze, color, decay
 		end
 	end
+	self.atmosTouched = atmosActive or nil
 	if (fogOn or skyOn) and not hasAtmos then
 		-- the place has no Atmosphere: make one of our own so fog / sky colour still show
 		local own = self.ownAtmos
@@ -3377,11 +3431,12 @@ function HUD:_lighting()
 		if sky.Parent then
 			if Config.HideSun then
 				sky.SunAngularSize, sky.MoonAngularSize, sky.StarCount = 0, 0, 0
-			else
+			elseif self.skyTouched then
 				sky.SunAngularSize, sky.MoonAngularSize, sky.StarCount = base.SunAngularSize, base.MoonAngularSize, base.StarCount
 			end
 		end
 	end
+	self.skyTouched = Config.HideSun or nil
 end
 
 -- Screen filters / bloom / sun rays: our own post-effect instances, switched on and off.
@@ -3403,10 +3458,18 @@ function HUD:_post()
 		return e
 	end
 	local f = FILTERS[Config.Filter]
-	if f then
+	local v = Config.Vibrancy
+	if f or v ~= 0 then
+		-- one colour-correction effect carries both the filter and the vibrancy slider
 		local cc, i = effect("fxCC", "ColorCorrectionEffect", "FF_ColorCorrection"), Config.FilterAmount
-		cc.Brightness, cc.Contrast, cc.Saturation = f.b * i, f.c * i, f.s * i
-		cc.TintColor = WHITE:Lerp(f.t, i)
+		local fb, fc, fs, ft = 0, 0, 0, WHITE
+		if f then
+			fb, fc, fs, ft = f.b * i, f.c * i, f.s * i, WHITE:Lerp(f.t, i)
+		end
+		cc.Brightness = fb
+		cc.Contrast = fc + v * 0.08 -- a touch of contrast keeps vivid colours from looking flat
+		cc.Saturation = fs + v
+		cc.TintColor = ft
 		cc.Enabled = true
 	elseif self.fxCC then
 		self.fxCC.Enabled = false
@@ -3425,24 +3488,6 @@ function HUD:_post()
 	elseif self.fxRays then
 		self.fxRays.Enabled = false
 	end
-end
-
--- "Wide view": Roblox caps FOV at 120, so anything above that is faked by pulling the camera
--- straight back along its look direction (about a quarter stud per extra degree). You see more
--- of the scene around you, much like a wider lens. The pull-back stops at walls.
-function HUD:_applyWide(camera)
-	local excess = self.fovCur and math.max(self.fovCur - 120, 0) or 0
-	if excess <= 0 or self.freecam then
-		self.wideBase = nil
-		return
-	end
-	local cf = camera.CFrame
-	local want = excess * 0.25
-	local hit = Workspace:Raycast(cf.Position, -cf.LookVector * (want + 0.5), self.rayParams)
-	local d = hit and math.max(hit.Distance - 0.5, 0) or want
-	self.wideBase = cf
-	camera.CFrame = cf * CFrame.new(0, 0, d)
-	self.wideApplied = camera.CFrame
 end
 
 -- Lets the camera zoom out further than the game normally allows.
@@ -3515,6 +3560,22 @@ function HUD:_boostStart()
 			Workspace.Terrain.Decoration = false
 		end)
 	end
+	-- post-processing lives in Lighting, not Workspace, so Max handles it separately (ours are left alone)
+	if level == "Max" then
+		local function isGamePost(o)
+			return o:IsA("PostEffect") and not o.Name:find("^FF_")
+		end
+		for _, o in Lighting:GetDescendants() do
+			if isGamePost(o) then
+				pcall(self._boostOne, self, o, level)
+			end
+		end
+		self.boostConn2 = Lighting.DescendantAdded:Connect(function(o)
+			if token == self.boostToken and isGamePost(o) then
+				pcall(self._boostOne, self, o, level)
+			end
+		end)
+	end
 	-- anything that streams in later is stripped too
 	self.boostConn = Workspace.DescendantAdded:Connect(function(inst)
 		if token == self.boostToken then
@@ -3542,6 +3603,10 @@ function HUD:_boostStop()
 	if self.boostConn then
 		self.boostConn:Disconnect()
 		self.boostConn = nil
+	end
+	if self.boostConn2 then
+		self.boostConn2:Disconnect()
+		self.boostConn2 = nil
 	end
 	local saved, detached = self.boostSaved, self.boostDetached
 	self.boostSaved, self.boostDetached = nil, nil
@@ -3703,15 +3768,6 @@ function HUD:Start()
 	-- Runs LAST in the frame, after every camera script, so projections match what is rendered.
 	-- Unique name per instance: a stale copy of this script can never unbind or collide with it.
 	self.stepName = "TacticalHUD_" .. tostring(math.random(1, 1000000000))
-	-- First thing each frame: take the wide-view pull-back off again, so a camera script that reads
-	-- the previous CFrame never sees it (otherwise the offset could compound frame after frame).
-	RunService:BindToRenderStep(self.stepName .. "_first", Enum.RenderPriority.First.Value, function()
-		local cam = Workspace.CurrentCamera
-		if cam and self.wideBase and cam.CFrame == self.wideApplied then
-			cam.CFrame = self.wideBase
-		end
-		self.wideBase = nil
-	end)
 	RunService:BindToRenderStep(self.stepName, Enum.RenderPriority.Last.Value, function(dt)
 		local ok, e = pcall(self.Update, self, dt)
 		if not ok then
@@ -3727,11 +3783,6 @@ function HUD:Destroy()
 	self.destroyed = true
 	if self.stepName then
 		RunService:UnbindFromRenderStep(self.stepName)
-		RunService:UnbindFromRenderStep(self.stepName .. "_first")
-		local cam = Workspace.CurrentCamera
-		if cam and self.wideBase and cam.CFrame == self.wideApplied then
-			cam.CFrame = self.wideBase
-		end
 	end
 	if self.freecam then
 		self:SetFreecam(false)

@@ -1,6 +1,6 @@
 --!strict
 --[[
-	TacticalHUD v6 — spectator / teammate / debug overlay with a tabbed menu.
+	TacticalHUD v9 — spectator / teammate / debug overlay with a tabbed menu.
 
 	Place as a LocalScript in StarterPlayer > StarterPlayerScripts.
 
@@ -22,6 +22,8 @@ local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local Workspace = game:GetService("Workspace")
 local TweenService = game:GetService("TweenService")
+local CollectionService = game:GetService("CollectionService")
+local Teams = game:GetService("Teams")
 local ContextActionService = game:GetService("ContextActionService")
 
 ----------------------------------------------------------------------
@@ -36,6 +38,24 @@ local Config = {
 	Enabled = true,
 	Mode = "All" :: Mode,
 	NeutralCountsAsTeam = false,
+
+	-- What counts as a target (for custom player systems / NPCs / bots):
+	--   "Players"    only real Players (their character is searched for widely)
+	--   "Tagged"     + any Model carrying the CollectionService tag TargetTag
+	--   "Humanoids"  + any Model in Workspace that contains a Humanoid
+	--   "Aggressive" + any Model that looks like a rig (a root-named part AND a head-named part)
+	-- Default is Players only: nothing but real players is ever marked. Widen it only
+	-- if you also want NPCs / bots / tagged rigs.
+	Discovery = "Players" :: "Players" | "Tagged" | "Humanoids" | "Aggressive",
+
+	-- TEAM FILTER. When ON, teammates are never drawn: no box, tag, tracer, chams,
+	-- arrow, radar dot, focus card or soft-lock. It overrides Mode. Teams are
+	-- detected from every source (see HUDManager._computeTeamId) and re-checked
+	-- every second plus instantly on team changes. Turn it OFF to see everyone.
+	TeamFilter = true,
+	TargetTag = "TacticalTarget",
+	MaxEntities = 150, -- cap on non-Player targets
+	IgnoreHealth = false, -- show targets even when their health reads 0 (custom health systems)
 
 	-- Pooling
 	PoolSize = 64,
@@ -67,6 +87,22 @@ local Config = {
 	ShowChams = false, -- NOTE: Roblox renders at most 31 Highlights at once
 	ChamsFillTransparency = 0.65,
 	ShowArrows = true,
+	-- Skeleton: bones are the rig's Motor6D joints (any rig that uses them); rigs
+	-- with no joints get a simple root-to-limb fallback. Drawn from a small pool.
+	-- Name tag placement. "Screen" projects the tag above the box, so it works on ANY rig
+	-- (no head part, no Adornee, invisible parts). "Billboard" attaches a BillboardGui
+	-- to the head/root part instead.
+	TagMode = "Screen" :: "Screen" | "Billboard",
+
+	ShowSkeleton = false,
+	SkeletonMaxDistance = 250, -- studs; skeletons cost ~16 projections per target
+	SkeletonThickness = 1.5,
+	SkeletonPoolSize = 10, -- max targets that can show a skeleton at once (nearest-first)
+
+	-- Where health is read from: "Auto" picks the best source and keeps re-verifying it;
+	-- the others force one source type (use if Auto picks wrong for your game).
+	HealthSource = "Auto" :: "Auto" | "Humanoid" | "Attributes" | "Values",
+
 	ArrowRadius = 0.82, -- fraction of the screen half-size
 
 	FadeTime = 0.2,
@@ -114,7 +150,7 @@ local Config = {
 
 	-- Screen overlay
 	ShowWatermark = true,
-	ShowFocusCard = true,
+	ShowFocusCard = false, -- target details card; turn it on in Overlay if you want it
 	ShowFocusRing = false,
 	ShowCrosshair = false,
 	CrosshairSize = 8,
@@ -174,16 +210,20 @@ local Config = {
 local Hooks: {
 	GetCharacter: ((Player) -> Model?)?,
 	GetHealth: ((Player, Model) -> (number, number))?, -- polled ~1x/second per target
+	-- Return anything that identifies the team (a Team, name, number, BrickColor...).
+	-- Used by the team filter before every other source. Return nil if unknown.
+	GetTeam: ((any, Model?) -> any)?,
 	CharacterFolder: Instance?,
 } = {}
 
 local RigConfig = {
-	RootPartNames = { "HumanoidRootPart", "RootPart", "Root", "Torso", "UpperTorso", "LowerTorso", "Hitbox" },
-	HeadPartNames = { "Head", "head", "Face" },
-	HealthAttribute = "Health",
-	MaxHealthAttribute = "MaxHealth",
-	HealthValueName = "Health",
-	MaxHealthValueName = "MaxHealth",
+	RootPartNames = { "HumanoidRootPart", "RootPart", "Root", "Torso", "UpperTorso", "LowerTorso" },
+	HeadPartNames = { "Head", "head", "Face", "HeadHB", "HeadHitbox", "HeadPart" },
+	-- Every name here is tried (in order) when looking for health on the character, then the player.
+	HealthAttributes = { "Health", "HP", "CurrentHealth", "health", "hp" },
+	MaxHealthAttributes = { "MaxHealth", "MaxHP", "maxHealth", "maxHP", "MaxHp" },
+	HealthValueNames = { "Health", "HP", "CurrentHealth" },
+	MaxHealthValueNames = { "MaxHealth", "MaxHP" },
 	RescanInterval = 1, -- seconds between per-target re-checks (one target per frame)
 }
 
@@ -195,7 +235,7 @@ local Presets: { { Name: string, Values: { [string]: any } } } = {
 		Values = {
 			Mode = "Teammates", ShowBoxes = true, BoxStyle = "Corners", ShowTracers = false, ShowNames = true,
 			ShowHealth = true, ShowDistance = true, ShowChams = false, ShowArrows = true, MaxRenderDistance = 800,
-			ShowRadar = true, ShowCrosshair = false, ShowFocusCard = true,
+			ShowRadar = true, ShowCrosshair = false, ShowFocusCard = false,
 		},
 	},
 	{
@@ -203,7 +243,7 @@ local Presets: { { Name: string, Values: { [string]: any } } } = {
 		Values = {
 			Mode = "All", ShowBoxes = true, BoxStyle = "Corners", ShowTracers = true, TracerOrigin = "Bottom",
 			ShowNames = true, ShowHealth = true, ShowDistance = true, ShowChams = true, ShowArrows = true,
-			MaxRenderDistance = 10000, ShowRadar = true, ShowFocusCard = true, ShowWatermark = true,
+			MaxRenderDistance = 10000, ShowRadar = true, ShowFocusCard = false, ShowWatermark = true, ShowSkeleton = true,
 		},
 	},
 	{
@@ -276,7 +316,15 @@ end
 local New = Utils.New
 
 -- Rig helpers (custom characters). Run at bind / rescan time, never per frame. --
+-- Direct children win over deeper matches, so an accessory's part that happens to
+-- be named "Head" or "Root" can never be mistaken for the rig's own.
 function Utils.FindPart(model: Model, names: { string }): BasePart?
+	for _, n in names do
+		local p = model:FindFirstChild(n)
+		if p and p:IsA("BasePart") then
+			return p
+		end
+	end
 	for _, n in names do
 		local p = model:FindFirstChild(n, true)
 		if p and p:IsA("BasePart") then
@@ -286,14 +334,23 @@ function Utils.FindPart(model: Model, names: { string }): BasePart?
 	return nil
 end
 
--- Root = first matching name, else PrimaryPart, else the largest part by volume.
-function Utils.ResolveRoot(model: Model): BasePart?
+-- Root = Humanoid.RootPart, else first matching name, else PrimaryPart, and only
+-- if allowLargest ~= false, the largest part by volume (a last resort: using it
+-- too early picks a random limb while the rig is still replicating).
+function Utils.ResolveRoot(model: Model, allowLargest: boolean?): BasePart?
+	local hum = model:FindFirstChildOfClass("Humanoid")
+	if hum and hum.RootPart and hum.RootPart:IsDescendantOf(model) then
+		return hum.RootPart
+	end
 	local named = Utils.FindPart(model, RigConfig.RootPartNames)
 	if named then
 		return named
 	end
 	if model.PrimaryPart then
 		return model.PrimaryPart
+	end
+	if allowLargest == false then
+		return nil
 	end
 	local best: BasePart? = nil
 	local bestVol = 0
@@ -309,8 +366,58 @@ function Utils.ResolveRoot(model: Model): BasePart?
 	return best
 end
 
+-- Does this model plausibly look like a character? Used to reject map objects that
+-- merely share a name with a player.
+function Utils.Plausible(model: Model): boolean
+	if model:FindFirstChildOfClass("Humanoid") then
+		return true
+	end
+	for _, n in RigConfig.RootPartNames do
+		local p = model:FindFirstChild(n)
+		if p and p:IsA("BasePart") then
+			return true
+		end
+	end
+	return model.PrimaryPart ~= nil
+end
+
 function Utils.ResolveHead(model: Model): BasePart?
 	return Utils.FindPart(model, RigConfig.HeadPartNames)
+end
+
+-- "Looks like a character": has a root-named part AND a head-named part.
+-- Direct children only, so container folders/models that merely hold rigs don't match.
+local function hasDirectPart(model: Model, names: { string }): boolean
+	for _, n in names do
+		local p = model:FindFirstChild(n)
+		if p and p:IsA("BasePart") then
+			return true
+		end
+	end
+	return false
+end
+function Utils.LooksLikeRig(model: Model): boolean
+	return hasDirectPart(model, RigConfig.RootPartNames) and hasDirectPart(model, RigConfig.HeadPartNames)
+end
+
+-- Wraps a bare Model in a Player-shaped table so the rest of the HUD
+-- (names, teams, health attributes, spectate) treats it like any target.
+function Utils.MakeEntity(model: Model): any
+	local e: any = {
+		IsEntity = true,
+		Model = model,
+		Name = model.Name,
+		DisplayName = tostring(model:GetAttribute("DisplayName") or model.Name),
+		UserId = 0,
+		Team = nil,
+	}
+	function e.GetAttribute(self: any, name: string)
+		return self.Model:GetAttribute(name)
+	end
+	function e.GetAttributeChangedSignal(self: any, name: string)
+		return self.Model:GetAttributeChangedSignal(name)
+	end
+	return e
 end
 
 local function asNumber(x: any, default: number): number
@@ -444,7 +551,8 @@ local localPlayer = Players.LocalPlayer
 -- Hover tooltips shown in the menu footer, keyed by control label.
 local Tips: { [string]: string } = {
 	["HUD enabled"] = "Master switch for every world overlay",
-	["Mode"] = "Track everyone, or only your team",
+	["Team filter (hide teammates)"] = "ON: teammates never get boxes, tags, arrows, radar dots or soft-lock (overrides Mode). OFF: show everyone",
+	["Mode"] = "Track everyone, or only your team (ignored while the team filter is on)",
 	["Teamless counts as ally"] = "In games without teams, treat everyone as a teammate",
 	["Boxes"] = "Corner-bracket box that scales with distance and FOV",
 	["Box style"] = "Corner brackets or a full outline",
@@ -469,7 +577,13 @@ local Tips: { [string]: string } = {
 	["Strength"] = "How much of the angle to the target is closed. 100% = hard lock",
 	["Smoothness"] = "Higher = slower ease in and out",
 	["Max active tags"] = "Hard cap on simultaneous pooled tags",
+	["Target discovery"] = "Players only, tagged models, any Humanoid model, or anything rig-shaped",
+	["Ignore health (always show)"] = "Show targets even if their health reads 0 (custom health systems)",
 	["Preset"] = "Pick a preset, then press Apply",
+	["Skeleton"] = "Bones drawn from the rig's joints (Motor6D), close targets only",
+	["Skeleton range"] = "Skeletons cost ~16 projections per target, so they stop beyond this",
+	["Name tag mode"] = "Screen: tag sits on the box, works on any rig. Billboard: attached to the head part",
+	["Health source"] = "Auto verifies and switches sources. Force one if Auto picks the wrong thing",
 	["Animated border"] = "Rotating gradient around the menu",
 	["Accent hue"] = "Drag across the spectrum to recolour the whole UI",
 	["Unload HUD"] = "Destroys the HUD and disconnects every signal",
@@ -1678,7 +1792,7 @@ export type Tag = {
 }
 
 type Record = {
-	Player: Player,
+	Player: any, -- a Player, or an entity table (see Utils.MakeEntity) for non-Player targets
 	Character: Model?,
 	Anchor: BasePart?, -- Head: name tag attachment
 	Root: BasePart?, -- HumanoidRootPart: culling + box centre
@@ -1706,6 +1820,18 @@ type Record = {
 	CenterY: number, -- bounding-box centre relative to the root part
 	TagOffset: Vector3, -- name tag offset above the anchor part
 	RigInfo: string, -- shown in Misc: which parts / health source were found
+	HealthSourceName: string,
+	HeadPart: BasePart?, -- the real head part, if the rig has one
+	HeadOffset: number, -- studs above the root to aim/anchor "head level" when there is no head part
+	HasHealth: boolean, -- false = no health source found (bar and HP text are hidden)
+	BadReads: number, -- consecutive invalid health reads (3 = re-detect the source)
+	ObservedMax: number, -- highest health seen; max-health fallback for sources without one
+	Verify: (() -> string?)?, -- health watchdog, called on each rescan
+	BoneParts: { BasePart }, -- unique parts used by the skeleton
+	BoneIdx: { number }, -- pairs of indices into BoneParts
+	Skel: any, -- pooled skeleton item while one is shown
+	SkelColor: Color3?,
+	SkelTr: number,
 	-- style cache: properties are only rewritten when one of these changes
 	Tier: number,
 	Focused: boolean,
@@ -1811,6 +1937,11 @@ end
 local function resetTag(tag: Tag)
 	tag.Gui.Enabled = false
 	tag.Gui.Adornee = nil
+	-- the tag content may have been moved to the screen overlay: bring it home
+	tag.Group.Parent = tag.Gui
+	tag.Group.AnchorPoint = Vector2.zero
+	tag.Group.Position = UDim2.new()
+	tag.Group.Size = UDim2.fromScale(1, 1)
 	tag.Group.GroupTransparency = 1
 	tag.Box.Visible = false
 	tag.Box.GroupTransparency = 1
@@ -1820,6 +1951,7 @@ local function resetTag(tag: Tag)
 end
 
 local function destroyTag(tag: Tag)
+	tag.Group:Destroy() -- may live in the overlay, outside the BillboardGui
 	tag.Gui:Destroy()
 	tag.Box:Destroy()
 	tag.Tracer:Destroy()
@@ -1843,7 +1975,13 @@ function HUDManager.new()
 	local self = setmetatable({}, HUDManager) :: any
 	self._destroyed = false
 	self._janitor = Utils.NewJanitor()
-	self._records = {} :: { [Player]: Record }
+	self._teamIds = setmetatable({}, { __mode = "k" }) :: { [any]: string? } -- target -> normalised team id
+	self._localTeamId = nil :: string?
+	self._records = {} :: { [Instance]: Record } -- keyed by Player, or by the Model for entities
+	self._entityCount = 0
+	self._ownerMap = setmetatable({}, { __mode = "k" }) :: { [Player]: Model } -- Player -> rig found by attribute
+	self._rejected = setmetatable({}, { __mode = "k" }) :: { [Instance]: number }
+	self._sweepToken = 0
 	self._list = {} :: { Record } -- same records as an array, for the time-sliced rescan
 	self._cursor, self._localTimer = 0, 0
 	self._lastLocal = nil :: Model?
@@ -1874,6 +2012,28 @@ function HUDManager.new()
 		a:Destroy()
 	end)
 
+	-- Skeletons: 24 reusable line Frames per item. Joint projections go into
+	-- preallocated arrays, so drawing a skeleton allocates nothing.
+	self._skelPool = Pool.new(Config.SkeletonPoolSize, function()
+		local lines: { Frame } = {}
+		for i = 1, 24 do
+			lines[i] = New("Frame", {
+				AnchorPoint = Vector2.new(0.5, 0.5), BorderSizePixel = 0, BackgroundTransparency = 1, Visible = false,
+			}, self._overlay)
+		end
+		return { Lines = lines, Used = 0 }
+	end, function(item: any)
+		for _, l in item.Lines do
+			l.Visible = false
+		end
+		item.Used = 0
+	end, function(item: any)
+		for _, l in item.Lines do
+			l:Destroy()
+		end
+	end)
+	self._projX, self._projY, self._projOk = table.create(40, 0), table.create(40, 0), table.create(40, false)
+
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Exclude
 	params.IgnoreWater = true
@@ -1886,7 +2046,7 @@ function HUDManager.new()
 	self._distTimer, self._distTick = 0, false
 	self._statsTimer, self._radarTimer = 0, 0
 	self._fpsFrames, self._fpsTimer, self._fps = 0, 0, 60
-	self._stats = { Total = 0, Mode = 0, Range = 0, Screen = 0, Radius = 0, Visible = 0, Arrows = 0 }
+	self._stats = { Total = 0, Mode = 0, Range = 0, Screen = 0, Radius = 0, Visible = 0, Arrows = 0, Bound = 0 }
 
 	-- Spectate / freecam state
 	self._specPlayer = nil :: Player?
@@ -1899,9 +2059,8 @@ function HUDManager.new()
 	self._assistHeld, self._assistToggled = false, false
 	self._assistW = 0 -- smoothed 0..1 engagement weight (ramps in and out)
 	self._assistRec = nil :: Record?
-	self._assistPart = nil :: BasePart?
+	self._assistLastRec = nil :: Record?
 	self._los, self._losTimer = true, 0
-	self._assistLabelOn, self._assistLabelPlayer = false, nil :: Player?
 	return self
 end
 
@@ -1927,22 +2086,51 @@ end
 
 -- Tag lifecycle ---------------------------------------------------------
 function HUDManager._bindTag(self: any, rec: Record, tag: Tag)
-	tag.Gui.Adornee = rec.Anchor
 	tag.Gui.StudsOffset = rec.TagOffset
 	tag.Chams.Adornee = rec.Character
-	tag.Name.Text = rec.Player.DisplayName
+	local p = rec.Player
+	local shownName = tostring(p.DisplayName or "")
+	tag.Name.Text = if shownName ~= "" then shownName else tostring(p.Name or "?")
+	self:_applyTagMode(rec, tag)
 	rec.GhostFrac = rec.HealthFrac
 	applyHealth(tag, rec.HealthFrac, rec.GhostFrac)
 	tag.Group.GroupTransparency = 1
 	tag.Box.GroupTransparency = 1
-	tag.Gui.Enabled = true
 	rec.Tag = tag
 	rec.Alpha, rec.AppliedAlpha = 0, 0
 	rec.Tier, rec.AppliedCfg, rec.LastDistM = -1, -1, -1 -- forces a full restyle
 end
 
+-- Puts the tag content where the current TagMode wants it. Safe to call repeatedly.
+function HUDManager._applyTagMode(self: any, rec: Record, tag: Tag)
+	if Config.TagMode == "Screen" then
+		tag.Gui.Enabled = false
+		tag.Gui.Adornee = nil
+		if tag.Group.Parent ~= self._overlay then
+			tag.Group.Parent = self._overlay
+		end
+		tag.Group.AnchorPoint = Vector2.new(0.5, 1)
+		tag.Group.Size = Config.TagSize
+	else
+		if tag.Group.Parent ~= tag.Gui then
+			tag.Group.Parent = tag.Gui
+		end
+		tag.Group.AnchorPoint = Vector2.zero
+		tag.Group.Position = UDim2.new()
+		tag.Group.Size = UDim2.fromScale(1, 1)
+		-- Adornee must be a part that is really in the world; fall back to the root
+		local a = rec.Anchor
+		if not (a and a:IsDescendantOf(Workspace)) then
+			a = rec.Root
+		end
+		tag.Gui.Adornee = a
+		tag.Gui.Enabled = a ~= nil
+	end
+end
+
 function HUDManager._releaseTag(self: any, rec: Record)
 	local tag = rec.Tag
+	self:_releaseSkel(rec)
 	if tag then
 		rec.Tag = nil
 		self._pool:Release(tag)
@@ -1965,6 +2153,9 @@ function HUDManager._unbindCharacter(self: any, rec: Record)
 	rec.CharJanitor:Clean()
 	rec.Character, rec.Anchor, rec.Root = nil, nil, nil
 	rec.Pending, rec.Refresh, rec.Polled = nil, nil, false
+	rec.Verify, rec.HeadPart, rec.HasHealth = nil, nil, false
+	table.clear(rec.BoneParts)
+	table.clear(rec.BoneIdx)
 	rec.Alive = false
 	rec.Occluded = false
 	self:_releaseTag(rec) -- immediate: the anchor is gone, nothing to fade
@@ -1973,41 +2164,266 @@ end
 
 -- Finds a player's character: custom hook, then Player.Character, then a model
 -- named after the player in the configured folder (or Workspace).
-function HUDManager._resolveCharacter(self: any, player: Player): Model?
+function HUDManager._resolveCharacter(self: any, player: any): Model?
+	if type(player) == "table" then
+		return player.Model -- entity: the model is the target
+	end
 	local hook = Hooks.GetCharacter
 	if hook then
 		local ok, result = pcall(hook, player)
 		return if ok and typeof(result) == "Instance" and result:IsA("Model") then result else nil
 	end
+	-- 1. the standard property
 	local c = player.Character
 	if c and c:IsDescendantOf(Workspace) then
 		return c
 	end
+	-- 2. a model named after the player (or their display name) in the character
+	--    folder / Workspace, then one level down inside container folders/models
+	local name, dname = player.Name, player.DisplayName
 	local folder = Hooks.CharacterFolder or Workspace
-	local f = folder:FindFirstChild(player.Name)
-	if f and f:IsA("Model") then
+	local f = folder:FindFirstChild(name) or folder:FindFirstChild(dname)
+	if f and f:IsA("Model") and Utils.Plausible(f) then
 		return f
+	end
+	for _, child in folder:GetChildren() do
+		if child:IsA("Folder") or child:IsA("Model") then
+			local g = child:FindFirstChild(name) or child:FindFirstChild(dname)
+			if g and g:IsA("Model") and Utils.Plausible(g) then -- never a map prop that just shares a name
+				return g
+			end
+		end
+	end
+	-- 3. a rig the discovery pass linked to this player by attribute / ObjectValue
+	local mapped = self._ownerMap[player]
+	if mapped and mapped:IsDescendantOf(Workspace) and Utils.Plausible(mapped) then
+		return mapped
+	end
+	return nil
+end
+
+-- Does this model claim to belong to a Player? Checks the usual attributes
+-- (UserId / PlayerId / OwnerId, Player / Owner / PlayerName / OwnerName) and
+-- ObjectValues named Player / Owner.
+function HUDManager._findOwner(self: any, model: Model): Player?
+	for _, key in { "UserId", "PlayerId", "OwnerId", "OwnerUserId" } do
+		local v = model:GetAttribute(key)
+		if type(v) == "number" then
+			local p = Players:GetPlayerByUserId(v)
+			if p then
+				return p
+			end
+		end
+	end
+	for _, key in { "Player", "Owner", "PlayerName", "OwnerName" } do
+		local v = model:GetAttribute(key)
+		if type(v) == "string" then
+			local p = Players:FindFirstChild(v)
+			if p and p:IsA("Player") then
+				return p
+			end
+		end
+	end
+	for _, key in { "Player", "Owner" } do
+		local ov = model:FindFirstChild(key)
+		if ov and ov:IsA("ObjectValue") and typeof(ov.Value) == "Instance" and ov.Value:IsA("Player") then
+			return ov.Value :: Player
+		end
 	end
 	return nil
 end
 
 -- Box size / centre / tag height from the model's real bounding box.
+-- Skeleton bones = the rig's Motor6D joints (accessories / tools skipped). Rigs
+-- without joints fall back to root-to-limb lines. Runs at ~1 Hz, only when the
+-- skeleton is on.
+function HUDManager._collectBones(self: any, rec: Record)
+	local ch, root = rec.Character, rec.Root
+	if not (ch and root) then
+		return
+	end
+	local parts, idx = rec.BoneParts, rec.BoneIdx
+	table.clear(parts)
+	table.clear(idx)
+	local map: { [BasePart]: number } = {}
+	local function pid(p: BasePart): number
+		local i = map[p]
+		if not i then
+			table.insert(parts, p)
+			i = #parts
+			map[p] = i
+		end
+		return i
+	end
+	local function skip(p: BasePart): boolean
+		return p.Name == "Handle" or p:FindFirstAncestorWhichIsA("Accessory") ~= nil or p:FindFirstAncestorWhichIsA("Tool") ~= nil
+	end
+	for _, d in ch:GetDescendants() do
+		if d:IsA("Motor6D") then
+			local a, b = d.Part0, d.Part1
+			if a and b and a:IsDescendantOf(ch) and b:IsDescendantOf(ch) and not skip(a) and not skip(b) then
+				table.insert(idx, pid(a))
+				table.insert(idx, pid(b))
+				if #idx >= 48 then
+					break
+				end
+			end
+		end
+	end
+	if #idx == 0 then
+		local ri = pid(root)
+		local n = 0
+		for _, c in ch:GetChildren() do
+			if c:IsA("BasePart") and c ~= root and not skip(c) then
+				table.insert(idx, ri)
+				table.insert(idx, pid(c))
+				n += 1
+				if n >= 10 then
+					break
+				end
+			end
+		end
+	end
+end
+
+function HUDManager._releaseSkel(self: any, rec: Record)
+	local s = rec.Skel
+	if s then
+		rec.Skel = nil
+		rec.SkelColor = nil
+		rec.SkelTr = -1
+		self._skelPool:Release(s)
+	end
+end
+
+-- Draws the bones as 2D lines. One WorldToViewportPoint per unique joint part.
+function HUDManager._drawSkeleton(self: any, rec: Record, color: Color3)
+	local parts, idx = rec.BoneParts, rec.BoneIdx
+	local nIdx = #idx
+	local camera = self._camera :: Camera?
+	if nIdx == 0 or not camera then
+		return
+	end
+	local skel = rec.Skel
+	if not skel then
+		skel = self._skelPool:Acquire()
+		if not skel then
+			return -- all skeleton slots are in use
+		end
+		rec.Skel = skel
+		rec.SkelColor, rec.SkelTr = nil, -1
+	end
+	local xs, ys, ok = self._projX, self._projY, self._projOk
+	for i = 1, #parts do
+		local p = parts[i]
+		if p.Parent then
+			local vp = camera:WorldToViewportPoint(p.Position)
+			xs[i], ys[i], ok[i] = vp.X, vp.Y, vp.Z > 0
+		else
+			ok[i] = false
+		end
+	end
+	local lines = skel.Lines
+	local tr = 1 - rec.Alpha * 0.9
+	if color ~= rec.SkelColor then
+		rec.SkelColor = color
+		for _, l in lines do
+			l.BackgroundColor3 = color
+		end
+	end
+	if tr ~= rec.SkelTr then
+		rec.SkelTr = tr
+		for _, l in lines do
+			l.BackgroundTransparency = tr
+		end
+	end
+	local thick = Config.SkeletonThickness
+	local used = 0
+	for b = 1, nIdx, 2 do
+		local ia, ib = idx[b], idx[b + 1]
+		if ok[ia] and ok[ib] then
+			used += 1
+			local line = lines[used]
+			if not line then
+				used -= 1
+				break
+			end
+			local x1, y1, x2, y2 = xs[ia], ys[ia], xs[ib], ys[ib]
+			local dx, dy = x2 - x1, y2 - y1
+			line.Position = UDim2.fromOffset((x1 + x2) * 0.5, (y1 + y2) * 0.5)
+			line.Size = UDim2.fromOffset(math.sqrt(dx * dx + dy * dy), thick)
+			line.Rotation = math.deg(math.atan2(dy, dx))
+			line.Visible = true
+		end
+	end
+	for i = used + 1, skel.Used do -- hide lines that were visible last frame but not now
+		lines[i].Visible = false
+	end
+	skel.Used = used
+end
+
 function HUDManager._measure(self: any, rec: Record)
+	if Config.ShowSkeleton then
+		self:_collectBones(rec)
+	end
 	local ch, root, anchor = rec.Character, rec.Root, rec.Anchor
 	if not (ch and root and anchor) or not Config.BoxFromModel then
 		return
 	end
-	local cf, size = ch:GetBoundingBox()
-	local h = math.max(size.Y * 1.06, 1)
-	rec.BoxH = h
-	rec.BoxW = math.clamp(math.max(size.X, size.Z) * 0.8, h * 0.3, h * 0.7)
-	rec.CenterY = cf.Position.Y - root.Position.Y
-	local top = cf.Position.Y + h * 0.5
-	rec.TagOffset = Vector3.new(0, math.max(top - anchor.Position.Y, 0.5) + 0.3, 0)
+	-- Own AABB over the body parts near the root. Model:GetBoundingBox would include
+	-- stray far-away parts (effects, hitbox clones, welded props) and drag the box
+	-- to the wrong place, so anything beyond 14 studs of the root is ignored.
+	local rp = root.Position
+	local minY, maxY, minX, maxX, minZ, maxZ = math.huge, -math.huge, math.huge, -math.huge, math.huge, -math.huge
+	local n = 0
+	for _, d in ch:GetDescendants() do
+		if d:IsA("BasePart") then
+			local cf, s = d.CFrame, d.Size * 0.5
+			local p = cf.Position
+			if (p - rp).Magnitude <= 14 then
+				local rx, ry, rz = cf.RightVector, cf.UpVector, cf.LookVector
+				local ex = math.abs(rx.X) * s.X + math.abs(ry.X) * s.Y + math.abs(rz.X) * s.Z
+				local ey = math.abs(rx.Y) * s.X + math.abs(ry.Y) * s.Y + math.abs(rz.Y) * s.Z
+				local ez = math.abs(rx.Z) * s.X + math.abs(ry.Z) * s.Y + math.abs(rz.Z) * s.Z
+				minX, maxX = math.min(minX, p.X - ex), math.max(maxX, p.X + ex)
+				minY, maxY = math.min(minY, p.Y - ey), math.max(maxY, p.Y + ey)
+				minZ, maxZ = math.min(minZ, p.Z - ez), math.max(maxZ, p.Z + ez)
+				n += 1
+			end
+		end
+	end
+	local h = maxY - minY
+	if n == 0 or h < 1 or h > 30 then
+		-- nothing sensible to measure: fixed size centred on the root
+		rec.BoxW, rec.BoxH, rec.CenterY = Config.BoxWidthStuds, Config.BoxHeightStuds, 0
+		rec.HeadOffset = Config.BoxHeightStuds * 0.5 - 0.7
+		rec.TagOffset = Vector3.new(0, math.max(Config.BoxHeightStuds * 0.5 + 0.8 - (anchor.Position.Y - rp.Y), 0.5), 0)
+	else
+		h *= 1.04
+		rec.BoxH = h
+		rec.BoxW = math.clamp(math.max(maxX - minX, maxZ - minZ) * 0.8, h * 0.3, h * 0.7)
+		rec.CenterY = math.clamp((minY + maxY) * 0.5 - rp.Y, -h, h)
+		-- "head level" for rigs with no head part: just under the top of the body
+		rec.HeadOffset = math.max(maxY - math.min(0.7, h * 0.12) - rp.Y, 0.5)
+		rec.TagOffset = Vector3.new(0, math.max(maxY - anchor.Position.Y, 0.5) + 0.3, 0)
+	end
 	local tag = rec.Tag
 	if tag then
 		tag.Gui.StudsOffset = rec.TagOffset
 	end
+end
+
+-- Frees one tag held by a non-Player (entity) target so a real Player can use it.
+function HUDManager._stealEntityTag(self: any): Tag?
+	local list = self._list
+	for i = #list, 1, -1 do
+		local r = list[i]
+		if r.Tag and type(r.Player) == "table" then
+			self:_releaseTag(r)
+			return self._pool:Acquire()
+		end
+	end
+	return nil
 end
 
 -- Time-sliced re-check, one target per frame: catches characters that custom
@@ -2018,6 +2434,19 @@ function HUDManager._rescan(self: any, rec: Record, now: number)
 		return
 	end
 	rec.NextScan = now + RigConfig.RescanInterval
+	local p = rec.Player
+	if type(p) == "table" then -- entity: drop it when the model is gone or the discovery mode no longer allows it
+		local m: Model = p.Model
+		local tagged = CollectionService:HasTag(m, Config.TargetTag)
+		local mode = Config.Discovery
+		if not m:IsDescendantOf(Workspace) or (not tagged and (mode == "Players" or mode == "Tagged")) then
+			self:_removePlayer(m)
+			return
+		end
+		local tn = m:GetAttribute("Team") or m:GetAttribute("TeamName")
+		p.Team = if type(tn) == "string" then Teams:FindFirstChild(tn) else nil
+		p.DisplayName = tostring(m:GetAttribute("DisplayName") or m.Name)
+	end
 	local resolved = self:_resolveCharacter(rec.Player)
 	local cur = rec.Character
 	if cur and not cur:IsDescendantOf(Workspace) then
@@ -2025,14 +2454,224 @@ function HUDManager._rescan(self: any, rec: Record, now: number)
 		cur = nil
 	end
 	if resolved and resolved ~= cur and resolved ~= rec.Pending then
+		local dup = self._records[resolved] -- an entity already tracks this rig: the Player wins
+		if dup and dup ~= rec then
+			self:_removePlayer(resolved)
+		end
 		self:_bindCharacter(rec, resolved)
 	elseif not resolved and cur then
 		self:_unbindCharacter(rec)
 	elseif cur then
+		-- the real root may have replicated after we bound a fallback: re-bind once
+		local better = Utils.ResolveRoot(cur, false)
+		if better and better ~= rec.Root then
+			self:_bindCharacter(rec, cur)
+			return
+		end
 		self:_measure(rec)
-		if rec.Polled and rec.Refresh then
+		-- No usable health source yet (it may appear late): keep looking, once a second.
+		if not rec.HasHealth then
+			self:_setupHealth(rec, cur, cur:FindFirstChildWhichIsA("Humanoid", true))
+			if rec.HasHealth then
+				rec.RigInfo = rec.RigInfo:gsub("health=[^\n]*$", "health=" .. rec.HealthSourceName)
+			end
+		end
+		-- Health safety net: re-read every second even for event-driven sources (catches
+		-- a renamed attribute / swapped Humanoid), and re-detect if the watchdog objects.
+		if rec.Refresh then
 			rec.Refresh()
 		end
+		local verify = rec.Verify
+		if verify and verify() then
+			self:_bindCharacter(rec, cur)
+		end
+	end
+end
+
+-- Health ------------------------------------------------------------------
+-- Collects EVERY health source this rig exposes, in priority order:
+--   Hook (Hooks.GetHealth) > Humanoid > attributes (character, then player) > Value objects.
+-- Each candidate: { Group, Name, Get() -> (health, max), Connect(janitor, refresh)?, Polled? }
+function HUDManager._healthCandidates(self: any, player: any, character: Model, hum: Humanoid?): { any }
+	local list: { any } = {}
+	local hook = Hooks.GetHealth
+	if hook then
+		table.insert(list, {
+			Group = "Hook", Name = "Hooks.GetHealth (polled)", Polled = true,
+			Get = function()
+				local ok, h, m = pcall(hook, player, character)
+				if ok then
+					return h, m
+				end
+				return nil, nil
+			end,
+		})
+	end
+	if hum then
+		table.insert(list, {
+			Group = "Humanoid", Name = "Humanoid",
+			Get = function()
+				return hum.Health, hum.MaxHealth
+			end,
+			Connect = function(j: Janitor, refresh: () -> ())
+				j:Add(hum.HealthChanged:Connect(refresh))
+				j:Add(hum:GetPropertyChangedSignal("MaxHealth"):Connect(refresh))
+			end,
+		})
+	end
+	for _, holder in { { character, "character" }, { player, "player" } } do
+		local obj: any = holder[1]
+		for _, hn in RigConfig.HealthAttributes do
+			if type(obj:GetAttribute(hn)) == "number" then
+				local mn: string? = nil
+				for _, cand in RigConfig.MaxHealthAttributes do
+					if type(obj:GetAttribute(cand)) == "number" then
+						mn = cand
+						break
+					end
+				end
+				table.insert(list, {
+					Group = "Attributes", Name = ("%s attribute '%s'"):format(holder[2], hn),
+					Get = function()
+						return obj:GetAttribute(hn), if mn then obj:GetAttribute(mn) else nil
+					end,
+					Connect = function(j: Janitor, refresh: () -> ())
+						j:Add(obj:GetAttributeChangedSignal(hn):Connect(refresh))
+						if mn then
+							j:Add(obj:GetAttributeChangedSignal(mn):Connect(refresh))
+						end
+					end,
+				})
+				break
+			end
+		end
+	end
+	for _, hn in RigConfig.HealthValueNames do
+		local hv: Instance? = character:FindFirstChild(hn, true)
+		if not (hv and hv:IsA("ValueBase")) and typeof(player) == "Instance" then
+			hv = player:FindFirstChild(hn, true)
+		end
+		if hv and hv:IsA("ValueBase") and type((hv :: any).Value) == "number" then
+			local mv: Instance? = nil
+			for _, mn in RigConfig.MaxHealthValueNames do
+				local c = if hv.Parent then hv.Parent:FindFirstChild(mn) else nil
+				if c and c:IsA("ValueBase") then
+					mv = c
+					break
+				end
+			end
+			table.insert(list, {
+				Group = "Values", Name = ("Value '%s'"):format(hv.Name),
+				Get = function()
+					return (hv :: any).Value, if mv then (mv :: any).Value else nil
+				end,
+				Connect = function(j: Janitor, refresh: () -> ())
+					j:Add((hv :: any).Changed:Connect(refresh))
+					if mv then
+						j:Add((mv :: any).Changed:Connect(refresh))
+					end
+				end,
+			})
+			break
+		end
+	end
+	return list
+end
+
+-- Picks a source, wires it up, and installs the watchdog (rec.Verify) that the
+-- rescan uses to catch a source that went bad or a better one that appeared.
+function HUDManager._setupHealth(self: any, rec: Record, character: Model, hum: Humanoid?)
+	-- Only sources that currently return a real number are eligible, so a dead source
+	-- (nil/NaN) is skipped instead of being picked, failing, and re-picked forever.
+	local cands: { any } = {}
+	for _, c in self:_healthCandidates(rec.Player, character, hum) do
+		local h = c.Get()
+		if type(h) == "number" and h == h then
+			table.insert(cands, c)
+		end
+	end
+	local mode = Config.HealthSource
+	local chosen: any = nil
+	if mode == "Auto" then
+		chosen = cands[1]
+		-- A stock Humanoid parked at 100/100 while the game keeps real health elsewhere
+		-- is the classic custom-health setup: prefer the first other source with a number.
+		if chosen and chosen.Group == "Humanoid" and hum and hum.Health == 100 and hum.MaxHealth == 100 then
+			for i = 2, #cands do
+				if type(cands[i].Get()) == "number" then
+					chosen = cands[i]
+					break
+				end
+			end
+		end
+	else
+		for _, c in cands do
+			if c.Group == mode then
+				chosen = c
+				break
+			end
+		end
+		chosen = chosen or cands[1]
+	end
+
+	rec.HealthSourceName = if chosen then chosen.Name else "none found"
+	rec.HasHealth = chosen ~= nil
+	rec.Polled = chosen ~= nil and chosen.Polled == true
+	rec.ObservedMax, rec.BadReads = 0, 0
+
+	local first = true
+	local function refresh()
+		local h, m = rec.Health, rec.MaxHealth
+		if chosen then
+			local rh, rm = chosen.Get()
+			if type(rh) == "number" then
+				h = rh
+				rec.ObservedMax = math.max(rec.ObservedMax, h)
+				-- no max supplied: fall back to the highest health ever seen
+				m = if type(rm) == "number" and rm > 0 then rm else math.max(rec.ObservedMax, 1)
+				rec.BadReads = 0
+			else
+				rec.BadReads += 1 -- keep the last good values
+			end
+		else
+			h, m = 100, 100
+		end
+		local frac = math.clamp(h / m, 0, 1)
+		if frac > rec.GhostFrac or first then
+			rec.GhostFrac = frac -- heals / first read: no damage trail
+		elseif frac < rec.HealthFrac then
+			rec.GhostHold = os.clock() + Config.GhostDelay
+		end
+		first = false
+		rec.Health, rec.MaxHealth = h, m
+		rec.HealthFrac = frac
+		rec.Alive = Config.IgnoreHealth or chosen == nil or h > 0
+		rec.LastDistM = -1 -- re-render the info line on the next tick
+		local tag = rec.Tag
+		if tag then
+			applyHealth(tag, frac, rec.GhostFrac)
+		end
+	end
+	rec.Refresh = refresh
+	refresh()
+	if chosen and chosen.Connect then
+		chosen.Connect(rec.CharJanitor, refresh)
+	end
+
+	-- Watchdog: returns a reason string when this source should be re-detected.
+	rec.Verify = function()
+		if rec.BadReads >= 3 then
+			return "source stopped returning numbers"
+		end
+		if mode == "Auto" and chosen and chosen.Group == "Humanoid" and hum
+			and hum.Health == 100 and hum.MaxHealth == 100 then
+			for i = 2, #cands do
+				if type(cands[i].Get()) == "number" then
+					return "a custom health source is available"
+				end
+			end
+		end
+		return nil
 	end
 end
 
@@ -2043,8 +2682,8 @@ function HUDManager._bindCharacter(self: any, rec: Record, character: Model)
 	-- Custom rigs can stream parts in late: wait (off the hot path) for a root part.
 	task.spawn(function()
 		local root: BasePart? = nil
-		for _ = 1, 30 do -- up to ~3 s
-			root = Utils.ResolveRoot(character)
+		for i = 1, 30 do -- up to ~3 s; "largest part" is only a fallback after 1.5 s
+			root = Utils.ResolveRoot(character, i > 15)
 			if root or self._destroyed or rec.BindToken ~= token then
 				break
 			end
@@ -2072,103 +2711,34 @@ function HUDManager._bindCharacter(self: any, rec: Record, character: Model)
 				return
 			end
 		end
+		-- Sanity: a Humanoid's RootPart is authoritative, and a "head" far from the
+		-- root is some other part that shares the name, so tags attach to the root.
+		local hrp = hum and hum.RootPart
+		if hrp and hrp:IsDescendantOf(character) then
+			root = hrp
+		end
+		if head and (head.Position - (root :: BasePart).Position).Magnitude > 10 then
+			head = nil
+		end
 		rec.Character, rec.Anchor, rec.Root = character, head or root, root
 		rec.Pending = nil
+		self._teamIds[rec.Player] = self:_computeTeamId(rec.Player, character) -- before anything can draw
 
-		-- Pick the health source. Event-driven wherever the rig allows it.
-		local player = rec.Player
-		local getHealth: (() -> (any, any))? = nil
-		local source = "none (always full)"
-		local hook = Hooks.GetHealth
-		local hA, mA = RigConfig.HealthAttribute, RigConfig.MaxHealthAttribute
-		if hook then
-			getHealth = function()
-				local ok, h, m = pcall(hook, player, character)
-				if ok then
-					return h, m
-				end
-				return nil, nil
-			end
-			rec.Polled = true
-			source = "Hooks.GetHealth (polled)"
-		elseif hum then
-			getHealth = function()
-				return hum.Health, hum.MaxHealth
-			end
-			source = "Humanoid"
-		elseif character:GetAttribute(hA) ~= nil then
-			getHealth = function()
-				return character:GetAttribute(hA), character:GetAttribute(mA)
-			end
-			source = "character attribute '" .. hA .. "'"
-		elseif player:GetAttribute(hA) ~= nil then
-			getHealth = function()
-				return player:GetAttribute(hA), player:GetAttribute(mA)
-			end
-			source = "player attribute '" .. hA .. "'"
-		else
-			local hv = character:FindFirstChild(RigConfig.HealthValueName, true)
-			if hv and hv:IsA("ValueBase") then
-				local mv = character:FindFirstChild(RigConfig.MaxHealthValueName, true)
-				getHealth = function()
-					return (hv :: any).Value, if mv and mv:IsA("ValueBase") then (mv :: any).Value else nil
-				end
-				source = "Value '" .. hv.Name .. "'"
-			end
-		end
-
-		local first = true
-		local function refresh()
-			local h, m = 100, 100
-			if getHealth then
-				local rh, rm = getHealth()
-				h = asNumber(rh, 100)
-				m = math.max(asNumber(rm, math.max(h, 100)), 1)
-			end
-			local frac = math.clamp(h / m, 0, 1)
-			if frac > rec.GhostFrac or first then
-				rec.GhostFrac = frac -- heals / first read: no trail
-			elseif frac < rec.HealthFrac then
-				rec.GhostHold = os.clock() + Config.GhostDelay
-			end
-			first = false
-			rec.Health, rec.MaxHealth = h, m
-			rec.HealthFrac = frac
-			rec.Alive = getHealth == nil or h > 0
-			rec.LastDistM = -1 -- re-render the info line on the next tick
-			local tag = rec.Tag
-			if tag then
-				applyHealth(tag, frac, rec.GhostFrac)
-			end
-		end
-		rec.Refresh = refresh
-		refresh()
-		if hum and not hook then
-			rec.CharJanitor:Add(hum.HealthChanged:Connect(refresh))
-			rec.CharJanitor:Add(hum:GetPropertyChangedSignal("MaxHealth"):Connect(refresh))
-		elseif not hook and getHealth then
-			if source:find("player attribute", 1, true) then
-				rec.CharJanitor:Add(player:GetAttributeChangedSignal(hA):Connect(refresh))
-				rec.CharJanitor:Add(player:GetAttributeChangedSignal(mA):Connect(refresh))
-			elseif source:find("character attribute", 1, true) then
-				rec.CharJanitor:Add(character:GetAttributeChangedSignal(hA):Connect(refresh))
-				rec.CharJanitor:Add(character:GetAttributeChangedSignal(mA):Connect(refresh))
-			else
-				local hv = character:FindFirstChild(RigConfig.HealthValueName, true)
-				if hv and hv:IsA("ValueBase") then
-					rec.CharJanitor:Add((hv :: any).Changed:Connect(refresh))
-				end
-			end
-		end
-
-		rec.RigInfo = ("root=%s  head=%s  health=%s"):format(root.Name, if head then head.Name else "none (tag on root)", source)
+		rec.HeadPart = head
+		self:_setupHealth(rec, character, hum)
+		rec.RigInfo = ("root=%s  head=%s  health=%s"):format(
+			root.Name, if head then head.Name else "none (head level estimated)", rec.HealthSourceName
+		)
 		self:_measure(rec)
 	end)
 end
 
 -- Player handling -------------------------------------------------------
-function HUDManager._addPlayer(self: any, player: Player)
-	if player == localPlayer or self._records[player] then
+-- `player` is a Player, or an entity table (Utils.MakeEntity) for non-Player targets.
+function HUDManager._addPlayer(self: any, player: any)
+	local isEntity = type(player) == "table"
+	local key: Instance = if isEntity then player.Model else player
+	if player == localPlayer or self._records[key] then
 		return
 	end
 	local rec: Record = {
@@ -2180,45 +2750,65 @@ function HUDManager._addPlayer(self: any, player: Player)
 		Pending = nil, Refresh = nil, Polled = false, NextScan = 0,
 		BoxW = Config.BoxWidthStuds, BoxH = Config.BoxHeightStuds, CenterY = 0,
 		TagOffset = Config.TagStudsOffset, RigInfo = "not bound yet",
+		HealthSourceName = "none yet", HeadPart = nil, HeadOffset = 1.6, HasHealth = false, BadReads = 0, ObservedMax = 0, Verify = nil,
+		BoneParts = {}, BoneIdx = {}, Skel = nil, SkelColor = nil, SkelTr = -1,
 		CharJanitor = Utils.NewJanitor(), PlayerJanitor = Utils.NewJanitor(),
 	}
-	self._records[player] = rec
+	self._records[key] = rec
+	self._teamIds[player] = self:_computeTeamId(player, nil)
 	table.insert(self._list, rec)
 	self._count += 1
-
-	rec.PlayerJanitor:Add(player.CharacterAdded:Connect(function(char)
-		self:_bindCharacter(rec, char)
-	end))
-	rec.PlayerJanitor:Add(player.CharacterRemoving:Connect(function()
-		self:_unbindCharacter(rec)
-	end))
+	if isEntity then
+		self._entityCount += 1
+	else
+		-- team changes take effect immediately, not on the next 1 s sweep
+		for _, prop in { "Team", "TeamColor", "Neutral" } do
+			rec.PlayerJanitor:Add(player:GetPropertyChangedSignal(prop):Connect(function()
+				self._teamIds[player] = self:_computeTeamId(player, rec.Character)
+			end))
+		end
+		rec.PlayerJanitor:Add(player.CharacterAdded:Connect(function(char)
+			self:_bindCharacter(rec, char)
+		end))
+		rec.PlayerJanitor:Add(player.CharacterRemoving:Connect(function()
+			self:_unbindCharacter(rec)
+		end))
+	end
 	local existing = self:_resolveCharacter(player)
 	if existing then
 		self:_bindCharacter(rec, existing)
 	end
-	self:_playersChanged()
+	if not isEntity then -- the spectate list only shows real Players
+		self:_playersChanged()
+	end
 end
 
-function HUDManager._removePlayer(self: any, player: Player)
-	local rec = self._records[player]
+-- `key` is the Player, or the Model for entities.
+function HUDManager._removePlayer(self: any, key: Instance)
+	local rec = self._records[key]
 	if not rec then
 		return
 	end
-	self._records[player] = nil
+	self._records[key] = nil
 	local idx = table.find(self._list, rec)
 	if idx then
 		table.remove(self._list, idx)
 	end
 	self._count -= 1
+	if type(rec.Player) == "table" then
+		self._entityCount -= 1
+	end
 	if self._focusRec == rec then
 		self._focusRec = nil
 	end
-	if self._specPlayer == player then
+	if self._specPlayer == rec.Player then
 		self:Spectate(nil)
 	end
 	self:_unbindCharacter(rec) -- tag returns to the pool immediately
 	rec.PlayerJanitor:Clean()
-	self:_playersChanged()
+	if type(rec.Player) ~= "table" then
+		self:_playersChanged()
+	end
 end
 
 function HUDManager._playersChanged(self: any)
@@ -2228,24 +2818,120 @@ function HUDManager._playersChanged(self: any)
 end
 
 -- Classification / culling helpers ----------------------------------------
-function HUDManager._passesMode(self: any, player: Player): boolean
+-- Team detection --------------------------------------------------------------
+-- Everything that can say "which team is this?" is normalised to a lowercase string
+-- id so different sources compare equal: a Team instance and an attribute
+-- "Red" both become "red".
+local TeamKeys = { "Team", "TeamName", "TeamId", "TeamID", "team", "Side", "Faction" }
+
+local function normTeam(v: any): string?
+	local t = typeof(v)
+	if t == "Instance" then
+		if v:IsA("Team") then
+			return v.Name:lower()
+		elseif v:IsA("ValueBase") then
+			return normTeam((v :: any).Value)
+		end
+		return v.Name:lower()
+	elseif t == "string" then
+		return if v == "" then nil else v:lower()
+	elseif t == "number" then
+		return tostring(v)
+	elseif t == "BrickColor" then
+		return "color:" .. v.Name
+	elseif t == "Color3" then
+		return "color:" .. v:ToHex()
+	end
+	return nil
+end
+
+-- Deep team lookup, in priority order: Hooks.GetTeam, Roblox Team, attributes on the
+-- player then the character, Value objects in the character, and finally TeamColor.
+-- Returns nil only when NO source knows the team.
+function HUDManager._computeTeamId(self: any, p: any, character: Model?): string?
+	local hook = Hooks.GetTeam
+	if hook then
+		local ok, r = pcall(hook, p, character)
+		if ok then
+			local id = normTeam(r)
+			if id then
+				return id
+			end
+		end
+	end
+	local id = normTeam(p.Team)
+	if id then
+		return id
+	end
+	for _, key in TeamKeys do
+		id = normTeam(p:GetAttribute(key))
+		if id then
+			return id
+		end
+		if character then
+			id = normTeam(character:GetAttribute(key))
+			if id then
+				return id
+			end
+		end
+	end
+	if character then
+		for _, key in TeamKeys do
+			local o = character:FindFirstChild(key)
+			if o and o:IsA("ValueBase") then
+				id = normTeam(o)
+				if id then
+					return id
+				end
+			end
+		end
+	end
+	if typeof(p) == "Instance" and not p.Neutral then
+		return normTeam(p.TeamColor)
+	end
+	return nil
+end
+
+-- Recomputes our own team and every target's team. Cheap (a few property reads per
+-- target); runs every second, on team-change signals, and when the filter changes.
+function HUDManager._refreshTeams(self: any)
+	self._localTeamId = self:_computeTeamId(localPlayer, self:_resolveCharacter(localPlayer))
+	for _, rec in self._list do
+		self._teamIds[rec.Player] = self:_computeTeamId(rec.Player, rec.Character)
+	end
+end
+
+-- 0 neutral (nobody on a team), 1 ally (same team id), 2 enemy
+function HUDManager._relation(self: any, player: any): number
+	local theirs, mine = self._teamIds[player], self._localTeamId
+	if theirs == nil and mine == nil then
+		return 0
+	end
+	return if theirs ~= nil and theirs == mine then 1 else 2
+end
+
+-- Is this target a teammate the filter must never draw?
+function HUDManager._blockedTeammate(self: any, player: any): boolean
+	if not Config.TeamFilter then
+		return false
+	end
+	local r = self:_relation(player)
+	return r == 1 or (r == 0 and Config.NeutralCountsAsTeam)
+end
+
+-- Should this target be drawn at all? (team filter first, then Mode)
+function HUDManager._passesMode(self: any, player: any): boolean
+	if Config.TeamFilter then
+		return not self:_blockedTeammate(player)
+	end
 	if Config.Mode == "All" then
 		return true
 	end
-	local mine, theirs = localPlayer.Team, player.Team
-	if mine == nil and theirs == nil then
+	local r = self:_relation(player)
+	if r == 0 then
 		return Config.NeutralCountsAsTeam
 	end
-	return mine == theirs
-end
-
--- 0 neutral, 1 ally, 2 enemy
-function HUDManager._relation(self: any, player: Player): number
-	local mine, theirs = localPlayer.Team, player.Team
-	if mine == nil and theirs == nil then
-		return 0
-	end
-	return if mine == theirs then 1 else 2
+	return r == 1
 end
 
 function HUDManager._accentFor(self: any, player: Player): Color3
@@ -2275,6 +2961,7 @@ function HUDManager._restyle(self: any, rec: Record, tag: Tag, tier: number, foc
 	rec.Tier, rec.Focused, rec.Accent = tier, focused, accent
 	rec.AppliedCfg = self._cfgVersion
 	rec.LastDistM = -1
+	self:_applyTagMode(rec, tag) -- picks up a TagMode change from the menu
 
 	local color = if focused then Config.FocusColor else accent
 	local full = Config.BoxStyle == "Full"
@@ -2295,7 +2982,7 @@ function HUDManager._restyle(self: any, rec: Record, tag: Tag, tier: number, foc
 	tag.Box.Visible = Config.ShowBoxes
 	tag.Tracer.Visible = Config.ShowTracers
 	tag.Name.Visible = Config.ShowNames and tier <= 1
-	tag.BarBack.Visible = Config.ShowHealth and tier == 0
+	tag.BarBack.Visible = Config.ShowHealth and tier == 0 and rec.HasHealth
 	tag.Info.Visible = Config.ShowDistance
 
 	local chams = tag.Chams
@@ -2328,6 +3015,17 @@ function HUDManager._layout(self: any, rec: Record, tag: Tag, vx: number, vy: nu
 		tag.Box.Size = UDim2.fromOffset(w, h)
 	end
 
+	-- Screen-mode name tag sits on top of the box: independent of any rig part.
+	if Config.TagMode == "Screen" then
+		tag.Group.Position = UDim2.fromOffset(vx, vy - h * 0.5 - 2)
+	end
+
+	if Config.ShowSkeleton and tier <= 1 and dist <= Config.SkeletonMaxDistance then
+		self:_drawSkeleton(rec, if rec.Focused then Config.FocusColor else rec.Accent or Config.EnemyColor)
+	elseif rec.Skel then
+		self:_releaseSkel(rec)
+	end
+
 	if Config.ShowTracers then
 		local ox, oy = self._cx, self._tracerY
 		local tx = vx
@@ -2343,7 +3041,7 @@ function HUDManager._layout(self: any, rec: Record, tag: Tag, vx: number, vy: nu
 		local m = math.floor(dist * Config.StudsToMeters)
 		if m ~= rec.LastDistM then
 			rec.LastDistM = m
-			if tier == 0 and Config.ShowHealth then
+			if tier == 0 and Config.ShowHealth and rec.HasHealth then
 				tag.Info.Text = string.format("%dm  |  %d HP", m, math.ceil(rec.Health))
 			else
 				tag.Info.Text = string.format("%dm", m)
@@ -2468,11 +3166,6 @@ function HUDManager._buildStatic(self: any)
 	New("UICorner", { CornerRadius = UDim.new(1, 0) }, assistRing)
 	New("UIStroke", { Thickness = 1, Transparency = 0.6, Color = Theme.Muted }, assistRing)
 	self._assistRing = assistRing
-	self._assistLabel = New("TextLabel", {
-		AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0.5, 34), Size = UDim2.fromOffset(240, 16),
-		BackgroundTransparency = 1, Font = Enum.Font.GothamBlack, TextSize = 12, TextColor3 = accent,
-		TextStrokeTransparency = 0.4, Visible = false, Text = "",
-	}, root)
 end
 
 -- Re-applies all config-driven static layout. Called from UI events only.
@@ -2645,13 +3338,16 @@ function HUDManager.Update(self: any, dt: number)
 	local assistCur = self._assistRec :: Record?
 	local assistScore = math.huge
 	local assistBest: Record? = nil
-	local nTotal, nMode, nRange, nScreen, nRadius, nVisible, nArrows = 0, 0, 0, 0, 0, 0, 0
+	local nTotal, nMode, nRange, nScreen, nRadius, nVisible, nArrows, nBound = 0, 0, 0, 0, 0, 0, 0, 0
 
 	for _, rec in self._records do
 		local want, wantArrow = false, false
 		local vx, vy, depth, dist = 0, 0, 1, 0
 		local root = rec.Root
 		local arrowPos = Vector3.zero
+		if root then
+			nBound += 1
+		end
 		if enabled and root and rec.Alive then
 			nTotal += 1
 			if self:_passesMode(rec.Player) then
@@ -2730,13 +3426,30 @@ function HUDManager.Update(self: any, dt: number)
 			self:_releaseArrow(rec)
 		end
 
+		-- Team filter: a teammate loses everything instantly (no fade-out).
+		if rec.Tag and not want and self:_blockedTeammate(rec.Player) then
+			self:_releaseTag(rec)
+			activeCount -= 1
+		end
+
 		-- Tag acquire / fade / release
 		if want then
-			if not rec.Tag and activeCount < maxTags then
-				local acquired = pool:Acquire()
+			if not rec.Tag then
+				local acquired = nil
+				local stolen = false
+				if activeCount < maxTags then
+					acquired = pool:Acquire()
+				end
+				if not acquired and type(rec.Player) ~= "table" then
+					-- real Players outrank NPC/entity targets when the pool is full
+					acquired = self:_stealEntityTag()
+					stolen = acquired ~= nil
+				end
 				if acquired then
 					self:_bindTag(rec, acquired)
-					activeCount += 1
+					if not stolen then
+						activeCount += 1
+					end
 				end
 			end
 			if rec.Tag and rec.Alpha < 1 then
@@ -2758,6 +3471,14 @@ function HUDManager.Update(self: any, dt: number)
 				tag.Group.GroupTransparency = 1 - a
 				tag.Box.GroupTransparency = 1 - a
 				tag.Tracer.BackgroundTransparency = 1 - a * tracerOpacity
+				local sk = rec.Skel
+				if sk then -- keep the skeleton fading in step with the rest
+					local trs = 1 - a * 0.9
+					rec.SkelTr = trs
+					for _, l in sk.Lines do
+						l.BackgroundTransparency = trs
+					end
+				end
 				if chamsOn then
 					tag.Chams.FillTransparency = 1 - a * fillMul
 					tag.Chams.OutlineTransparency = 1 - a
@@ -2782,7 +3503,7 @@ function HUDManager.Update(self: any, dt: number)
 	self._assistRec = assistBest
 	local stats = self._stats
 	stats.Total, stats.Mode, stats.Range, stats.Screen = nTotal, nMode, nRange, nScreen
-	stats.Radius, stats.Visible, stats.Arrows = nRadius, nVisible, nArrows
+	stats.Radius, stats.Visible, stats.Arrows, stats.Bound = nRadius, nVisible, nArrows, nBound
 
 	-- Throttled extras ---------------------------------------------------
 	self._radarTimer += dt
@@ -2801,12 +3522,18 @@ function HUDManager.Update(self: any, dt: number)
 	local nList = #list
 	if nList > 0 then
 		self._cursor = self._cursor % nList + 1
-		self:_rescan(list[self._cursor], now)
+		-- pcall: a bad custom rig must never be able to break the render loop
+		local ok, err = pcall(self._rescan, self, list[self._cursor], now)
+		if not ok and not self._warnedRescan then
+			self._warnedRescan = true
+			warn("[TacticalHUD] rescan error (further ones suppressed): " .. tostring(err))
+		end
 	end
 	-- Keep our own (possibly custom) character out of occlusion rays
 	self._localTimer += dt
 	if self._localTimer >= 1 then
 		self._localTimer = 0
+		self:_refreshTeams() -- deep team re-check, every second
 		local lc = self:_resolveCharacter(localPlayer)
 		if lc ~= self._lastLocal then
 			self._lastLocal = lc
@@ -2837,7 +3564,8 @@ function HUDManager.Update(self: any, dt: number)
 			dbg.Text = string.format(
 				"tracked   %d\npass mode %d\nin range  %d\non screen %d\nin radius %d\nvisible   %d\narrows    %d\npool free %d/%d\n\nfocus rig: %s",
 				stats.Total, stats.Mode, stats.Range, stats.Screen, stats.Radius, stats.Visible, stats.Arrows,
-				pool:FreeCount(), pool:Capacity(), if fr then fr.RigInfo else "(aim near a target)"
+				pool:FreeCount(), pool:Capacity(),
+				if fr then ("%s  team=%s (you: %s)"):format(fr.RigInfo, tostring(self._teamIds[fr.Player]), tostring(self._localTeamId)) else "(aim near a target)"
 			)
 		end
 	end
@@ -2859,6 +3587,28 @@ function HUDManager._assistWanted(self: any): boolean
 	return self._assistHeld
 end
 
+-- World position the soft-lock aims at.
+--   Head : the real head part when the rig has one, otherwise the root lifted to the
+--          top of the measured body (so "head" is head level on ANY rig, never the torso).
+--   Torso: the centre of the measured body (chest level), not the root part, which is
+--          often at the hips.
+function HUDManager._aimPoint(self: any, rec: Record): Vector3?
+	local root = rec.Root
+	if not root or not root:IsDescendantOf(Workspace) then
+		return nil
+	end
+	if Config.AssistPart == "Head" then
+		local head = rec.HeadPart
+		if head and head:IsDescendantOf(Workspace) then
+			return head.Position
+		end
+		local p = root.Position
+		return Vector3.new(p.X, p.Y + rec.HeadOffset, p.Z)
+	end
+	local p = root.Position
+	return Vector3.new(p.X, p.Y + rec.CenterY, p.Z)
+end
+
 -- Eases the camera toward the chosen target by Strength * weight, where the
 -- weight ramps 0 -> 1 on engage and back to 0 on release (Smoothness sets the
 -- ramp speed), so the camera never snaps. The camera script re-derives its
@@ -2867,52 +3617,43 @@ end
 function HUDManager._applyAssist(self: any, camera: Camera, dt: number)
 	local rec = self._assistRec :: Record?
 	local engaged = rec ~= nil and self:_assistWanted()
-	local part: BasePart? = nil
+	local aim: Vector3? = nil
 	if engaged and rec then
-		part = if Config.AssistPart == "Head" then rec.Anchor else rec.Root
-		engaged = part ~= nil and rec.Alive
+		aim = self:_aimPoint(rec)
+		engaged = aim ~= nil and rec.Alive
 	end
 
 	local pos = camera.CFrame.Position
-	if engaged and part and rec and Config.AssistRequireLos then
+	if engaged and aim and rec and Config.AssistRequireLos then
 		self._losTimer += dt
 		if self._losTimer >= 0.05 then -- 20 Hz line-of-sight check
 			self._losTimer = 0
-			local hit = Workspace:Raycast(pos, part.Position - pos, self._rayParams)
+			local hit = Workspace:Raycast(pos, aim - pos, self._rayParams)
 			local character = rec.Character
 			self._los = hit == nil or (character ~= nil and hit.Instance:IsDescendantOf(character))
 		end
 		engaged = self._los
 	end
 
-	if engaged and part then
-		self._assistPart = part -- remembered so the release ramp can finish smoothly
+	if engaged and rec then
+		self._assistLastRec = rec -- remembered so the release ramp can finish smoothly
 	end
 	local speed = 3 + (1 - Config.AssistSmoothness) * 27
 	self._assistW += ((if engaged then 1 else 0) - self._assistW) * (1 - math.exp(-speed * dt))
 
-	local aimPart = self._assistPart :: BasePart?
-	if self._assistW < 0.002 or not aimPart or not aimPart:IsDescendantOf(Workspace) then
-		self._assistW = 0
-		self._assistPart = nil
-	else
-		local cf = camera.CFrame
-		if (aimPart.Position - pos).Magnitude > 1e-3 then
-			-- lookAt keeps the world-up axis, so the pull never introduces camera roll
-			camera.CFrame = cf:Lerp(CFrame.lookAt(pos, aimPart.Position), math.clamp(Config.AssistStrength, 0, 1) * self._assistW)
-		end
+	local last = self._assistLastRec :: Record?
+	local point: Vector3? = nil
+	if engaged and aim then
+		point = aim
+	elseif last then
+		point = self:_aimPoint(last)
 	end
-
-	-- Indicator label (written only on state change)
-	local showLabel = engaged and self._assistW > 0.3
-	local target = if showLabel and rec then rec.Player else nil
-	if showLabel ~= self._assistLabelOn or target ~= self._assistLabelPlayer then
-		self._assistLabelOn, self._assistLabelPlayer = showLabel, target
-		self._assistLabel.Visible = showLabel
-		if target then
-			self._assistLabel.Text = "ASSIST  " .. target.DisplayName
-			self._assistLabel.TextColor3 = Theme.Accent
-		end
+	if self._assistW < 0.002 or not point then
+		self._assistW = 0
+		self._assistLastRec = nil
+	elseif (point - pos).Magnitude > 1e-3 then
+		-- lookAt keeps the world-up axis, so the pull never introduces camera roll
+		camera.CFrame = camera.CFrame:Lerp(CFrame.lookAt(pos, point), math.clamp(Config.AssistStrength, 0, 1) * self._assistW)
 	end
 end
 
@@ -2947,12 +3688,14 @@ function HUDManager.Spectate(self: any, player: Player?)
 	else
 		self._specPlayer = player
 		follow(self:_resolveCharacter(player))
-		self._specJanitor:Add(player.CharacterAdded:Connect(function(char)
-			task.wait(0.3) -- let the rig's parts replicate
-			if self._specPlayer == player and not self._destroyed then
-				follow(char)
-			end
-		end))
+		if type(player) ~= "table" then -- entities have no CharacterAdded
+			self._specJanitor:Add(player.CharacterAdded:Connect(function(char)
+				task.wait(0.3) -- let the rig's parts replicate
+				if self._specPlayer == player and not self._destroyed then
+					follow(char)
+				end
+			end))
+		end
 	end
 	self:_playersChanged()
 	if self._menu then
@@ -3109,16 +3852,58 @@ function HUDManager._buildMenu(self: any)
 	local vis = menu.AddTab("Visuals", "◆", "What is drawn on players, how far, and in what colours")
 	vis.Section("Targets")
 	cfgToggle(vis, "HUD enabled", "Enabled")
+	vis.Toggle("Team filter (hide teammates)", function()
+		return Config.TeamFilter
+	end, function(v: boolean)
+		Config.TeamFilter = v
+		self:_refreshTeams()
+	end)
 	cfgCycle(vis, "Mode", "Mode", { "All", "Teammates" })
 	cfgToggle(vis, "Teamless counts as ally", "NeutralCountsAsTeam")
+	vis.Cycle("Target discovery", { "Players", "Tagged", "Humanoids", "Aggressive" }, function()
+		return Config.Discovery
+	end, function(v: string)
+		(Config :: any).Discovery = v
+		self:_rescanAll()
+	end)
+	vis.Toggle("Ignore health (always show)", function()
+		return Config.IgnoreHealth
+	end, function(v: boolean)
+		Config.IgnoreHealth = v
+		for _, r in self._list do
+			if r.Refresh then
+				r.Refresh()
+			end
+		end
+	end)
 	vis.Section("ESP")
 	cfgToggle(vis, "Boxes", "ShowBoxes")
 	cfgCycle(vis, "Box style", "BoxStyle", { "Corners", "Full" })
 	cfgToggle(vis, "Box from model size", "BoxFromModel")
+	vis.Toggle("Skeleton", function()
+		return Config.ShowSkeleton
+	end, function(v: boolean)
+		Config.ShowSkeleton = v
+		if v then
+			for _, r in self._list do
+				self:_collectBones(r) -- build the bone list now, not at the next rescan
+			end
+		end
+	end)
+	cfgSlider(vis, "Skeleton range", "SkeletonMaxDistance", 30, 1000, { Step = 10, Format = function(v: number)
+		return ("%d studs"):format(math.floor(v))
+	end })
+	cfgCycle(vis, "Name tag mode", "TagMode", { "Screen", "Billboard" })
 	cfgToggle(vis, "Tracers", "ShowTracers")
 	cfgCycle(vis, "Tracer origin", "TracerOrigin", { "Bottom", "Center", "Top" })
 	cfgToggle(vis, "Names", "ShowNames")
 	cfgToggle(vis, "Health bars", "ShowHealth")
+	vis.Cycle("Health source", { "Auto", "Humanoid", "Attributes", "Values" }, function()
+		return Config.HealthSource
+	end, function(v: string)
+		(Config :: any).HealthSource = v
+		self:_rebindAll()
+	end)
 	cfgToggle(vis, "Distance", "ShowDistance")
 	cfgToggle(vis, "Chams (highlight)", "ShowChams")
 	cfgSlider(vis, "Chams fill transparency", "ChamsFillTransparency", 0, 1, { Step = 0.05 })
@@ -3291,6 +4076,18 @@ function HUDManager._buildMenu(self: any)
 	misc.Section("Culling counters (live)")
 	self._debugInfo = misc.Info(190)
 	misc.Section("Tools")
+	misc.Button("Rescan all targets now", function()
+		self:_rescanAll()
+		menu.Toast("Rescanning...")
+	end)
+	misc.Button("Health self-test (print to output)", function()
+		self:PrintHealthProbe()
+		menu.Toast("Health probe printed to Output")
+	end)
+	misc.Button("Print rig report to output", function()
+		self:PrintReport()
+		menu.Toast("Report printed to Output")
+	end)
 	misc.Button("Print counters to output", function()
 		local s = self._stats
 		print(("[TacticalHUD] tracked=%d mode=%d range=%d screen=%d radius=%d visible=%d arrows=%d pool=%d/%d"):format(
@@ -3376,6 +4173,232 @@ function HUDManager._buildMenu(self: any)
 	return baseOnChange
 end
 
+-- Discovery (non-Player targets, and rigs the Player path can't find) ------
+-- Event-driven: new Humanoids / rig-shaped parts / tagged models are picked up
+-- as they appear, plus a one-time chunked scan and a slow sweep for anything
+-- the events missed (e.g. a head streaming in after the root).
+function HUDManager._consider(self: any, model: Model)
+	if self._records[model] or not model:IsDescendantOf(Workspace) then
+		return
+	end
+	local mode = Config.Discovery
+	local tagged = CollectionService:HasTag(model, Config.TargetTag)
+	if mode == "Players" and not tagged then
+		return
+	end
+	local rejectedAt = self._rejected[model]
+	if rejectedAt and os.clock() - rejectedAt < 4 then
+		return
+	end
+	if self._entityCount >= Config.MaxEntities or model.Name == localPlayer.Name or Players:GetPlayerFromCharacter(model) then
+		return
+	end
+	local lc = self:_resolveCharacter(localPlayer)
+	if lc and (model == lc or model:IsDescendantOf(lc) or lc:IsDescendantOf(model)) then
+		return
+	end
+	local named = Players:FindFirstChild(model.Name)
+	if named and named:IsA("Player") then
+		return -- the Player path owns this one
+	end
+	for _, rec in self._list do
+		local ch = rec.Character
+		if model == rec.Pending or (ch and (model == ch or model:IsDescendantOf(ch))) then
+			return
+		end
+	end
+	-- Claimed by a Player (attribute / ObjectValue)? Link it instead of duplicating.
+	local owner = self:_findOwner(model)
+	if owner then
+		if owner ~= localPlayer then
+			self._ownerMap[owner] = model
+			local rec = self._records[owner]
+			if rec then
+				rec.NextScan = 0
+			end
+		end
+		return
+	end
+	local ok = tagged
+	if not ok and mode ~= "Tagged" then
+		ok = model:FindFirstChildOfClass("Humanoid") ~= nil or (mode == "Aggressive" and Utils.LooksLikeRig(model))
+	end
+	if not ok then
+		self._rejected[model] = os.clock()
+		return
+	end
+	self:_addPlayer(Utils.MakeEntity(model))
+end
+
+function HUDManager._onDescendant(self: any, inst: Instance)
+	local mode = Config.Discovery
+	if mode == "Players" or mode == "Tagged" then
+		return
+	end
+	local isHumanoid = inst:IsA("Humanoid")
+	if isHumanoid or (mode == "Aggressive" and inst:IsA("BasePart") and (self._rootNames[inst.Name] or self._headNames[inst.Name])) then
+		local m = inst.Parent
+		if m and m:IsA("Model") then
+			self:_consider(m)
+		end
+	end
+end
+
+function HUDManager._startSweep(self: any)
+	self._sweepToken += 1
+	local token = self._sweepToken
+	task.spawn(function()
+		while not self._destroyed and token == self._sweepToken do
+			local n = 0
+			local function visit(container: Instance)
+				for _, c in container:GetChildren() do
+					if self._destroyed or token ~= self._sweepToken then
+						return
+					end
+					if c:IsA("Model") then
+						self:_consider(c)
+						if not self._records[c] then -- maybe a container: look one level inside
+							for _, g in c:GetChildren() do
+								if g:IsA("Model") then
+									self:_consider(g)
+								end
+							end
+						end
+					elseif c:IsA("Folder") then
+						for _, g in c:GetChildren() do
+							if g:IsA("Model") then
+								self:_consider(g)
+							end
+						end
+					end
+					n += 1
+					if n % 25 == 0 then
+						task.wait()
+					end
+				end
+			end
+			if Config.Discovery ~= "Players" then
+				visit(Workspace)
+				if Hooks.CharacterFolder then
+					visit(Hooks.CharacterFolder)
+				end
+			end
+			for _, t in CollectionService:GetTagged(Config.TargetTag) do
+				if t:IsA("Model") then
+					self:_consider(t)
+				end
+			end
+			task.wait(6)
+		end
+	end)
+end
+
+function HUDManager._startDiscovery(self: any)
+	local function setOf(names: { string }): { [string]: boolean }
+		local s = {}
+		for _, n in names do
+			s[n] = true
+		end
+		return s
+	end
+	self._rootNames, self._headNames = setOf(RigConfig.RootPartNames), setOf(RigConfig.HeadPartNames)
+	local j = self._janitor
+	j:Add(Workspace.DescendantAdded:Connect(function(inst)
+		self:_onDescendant(inst)
+	end))
+	j:Add(CollectionService:GetInstanceAddedSignal(Config.TargetTag):Connect(function(inst)
+		if inst:IsA("Model") then
+			self:_consider(inst)
+		end
+	end))
+	-- one-time pass over everything already in the world, chunked to avoid a hitch
+	task.spawn(function()
+		local n = 0
+		for _, d in Workspace:GetDescendants() do
+			if self._destroyed then
+				return
+			end
+			self:_onDescendant(d)
+			n += 1
+			if n % 1500 == 0 then
+				task.wait()
+			end
+		end
+	end)
+	self:_startSweep()
+end
+
+-- Re-run discovery from scratch (menu button / mode change).
+function HUDManager._rescanAll(self: any)
+	for _, rec in self._list do
+		rec.NextScan = 0
+	end
+	table.clear(self._rejected)
+	self:_startSweep()
+end
+
+-- Re-runs character binding (and with it health/skeleton detection) for every target.
+function HUDManager._rebindAll(self: any)
+	for _, rec in self._list do
+		if rec.Character then
+			self:_bindCharacter(rec, rec.Character)
+		end
+	end
+end
+
+-- Health self-test: for every bound target, prints each health source the rig exposes,
+-- its current reading, and which one the HUD is using.
+function HUDManager.PrintHealthProbe(self: any)
+	local out = { ("[TacticalHUD] health probe | HealthSource=%s"):format(Config.HealthSource) }
+	for _, rec in self._list do
+		local ch = rec.Character
+		if ch then
+			local hum = ch:FindFirstChildWhichIsA("Humanoid", true)
+			local found = {}
+			for _, c in self:_healthCandidates(rec.Player, ch, hum) do
+				local h, m = c.Get()
+				table.insert(found, ("%s = %s / %s"):format(c.Name, tostring(h), tostring(m)))
+			end
+			table.insert(out, ("%s | using: %s | bar shows %d%% | sources: %s"):format(
+				tostring(rec.Player.Name), rec.HealthSourceName, math.floor(rec.HealthFrac * 100 + 0.5),
+				if #found > 0 then table.concat(found, "; ") else "NONE FOUND"
+			))
+		end
+	end
+	print(table.concat(out, "\n"))
+end
+
+-- Prints why each target is (or isn't) being tracked. Use it when a rig won't show.
+function HUDManager.PrintReport(self: any)
+	local out = {
+		("[TacticalHUD] rig report | discovery=%s | records=%d (entities=%d) | players online=%d"):format(
+			Config.Discovery, #self._list, self._entityCount, #Players:GetPlayers()
+		),
+	}
+	for _, p in Players:GetPlayers() do
+		if p ~= localPlayer then
+			local rec = self._records[p]
+			local found = self:_resolveCharacter(p)
+			table.insert(out, ("PLAYER %s | Player.Character=%s | resolved=%s | %s"):format(
+				p.Name,
+				if p.Character then p.Character:GetFullName() else "nil",
+				if found then found:GetFullName() else "NOT FOUND",
+				if rec then rec.RigInfo else "no record"
+			))
+		end
+	end
+	for _, rec in self._list do
+		if type(rec.Player) == "table" then
+			table.insert(out, ("ENTITY %s | alive=%s | %s"):format(rec.Player.Model:GetFullName(), tostring(rec.Alive), rec.RigInfo))
+		end
+	end
+	local s = self._stats
+	table.insert(out, ("pipeline: bound=%d tracked=%d mode=%d range=%d screen=%d radius=%d visible=%d"):format(
+		s.Bound, s.Total, s.Mode, s.Range, s.Screen, s.Radius, s.Visible
+	))
+	print(table.concat(out, "\n"))
+end
+
 -- Lifecycle -------------------------------------------------------------
 function HUDManager.Start(self: any)
 	local j = self._janitor
@@ -3393,6 +4416,14 @@ function HUDManager.Start(self: any)
 	onLocalChar(localPlayer.Character)
 	j:Add(localPlayer.CharacterAdded:Connect(onLocalChar))
 
+	-- Know our own team before any target can be drawn; react to our own team changes.
+	self:_refreshTeams()
+	for _, prop in { "Team", "TeamColor", "Neutral" } do
+		j:Add(localPlayer:GetPropertyChangedSignal(prop):Connect(function()
+			self:_refreshTeams()
+		end))
+	end
+
 	self:_buildStatic()
 	self:_buildMenu()
 	self:_applyStatic()
@@ -3406,6 +4437,7 @@ function HUDManager.Start(self: any)
 	for _, p in Players:GetPlayers() do
 		self:_addPlayer(p)
 	end
+	self:_startDiscovery()
 
 	local menu = self._menu
 	j:Add(UserInputService.InputBegan:Connect(function(input, processed)
@@ -3482,6 +4514,7 @@ function HUDManager.Destroy(self: any)
 	end
 	self._pool:Destroy()
 	self._arrowPool:Destroy()
+	self._skelPool:Destroy()
 	self._folder:Destroy()
 	self._overlay:Destroy()
 	self._static:Destroy()

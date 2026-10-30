@@ -1,6 +1,6 @@
 --!nonstrict
 --[[
-	Festering Felix (v20)
+	Festering Felix (v23)
 	Player ESP + radar + lock-on assist + spectate tools + FOV / fullbright / FPS booster, with a minimal menu.
 	Place as a LocalScript in StarterPlayer > StarterPlayerScripts.
 
@@ -41,13 +41,36 @@ local Config = {
 	SkeletonRange = 250,
 	Chams = false,
 	ChamsFill = 0.75, -- fill transparency
+	ChamsStyle = "Highlight", -- "Highlight" | "Parts" (solid boxes on the body parts; works where Highlight does not)
+	SkeletonStyle = "Auto", -- "Auto" (joints, checked; stick figure if they look wrong) | "Joints" | "Stick"
 	ChamsMax = 28, -- Roblox draws at most ~31 Highlights, nearest first
 	ChamsRange = 10000, -- chams are applied out to this distance
+	ChamsOutline = 0.1, -- outline transparency
+	ChamsDepth = "Through walls", -- "Through walls" | "Normal"
+	ChamsColorMode = "Team", -- "Team" | "Fixed"
+	ChamsColor = Color3.fromRGB(255, 255, 255),
+	BoxThickness = 2,
+	BoxFill = 0.95, -- fill transparency (1 = none)
+	BoxCorner = 0.3, -- corner length when the style is Corners
+	BoxWidth = 1, -- scale the drawn box (for rigs whose size is measured oddly)
+	BoxHeight = 1,
+	NameSource = "Display", -- "Display" | "Username" | "Both"
+	DistUnit = "Meters", -- "Meters" | "Feet" | "Studs"
+	SkeletonThick = 1,
+	SkeletonOpacity = 0.9,
+	TracerThick = 1,
+	TracerOpacity = 0.45,
+	RootNames = "", -- extra part names for rigs the script can't read, comma separated
+	HeadNames = "",
+	TorsoNames = "",
 	Arrows = true, -- ticks at the screen edge pointing to off-screen targets
 	Alert = true, -- proximity alert: close players make their arrow grow and turn white
 	AlertRadius = 80,
 	Readout = false, -- small "n players - nearest x m" counter
 	Tracers = false,
+	Trails = false, -- fading line behind each player showing where they have just been
+	TrailTime = 2.5, -- seconds of history
+	TrailThick = 2,
 	TracerFrom = "Bottom", -- "Bottom" | "Center" | "Top"
 	VisTint = true, -- dim targets that are behind cover
 	EnemyColor = Color3.fromRGB(232, 90, 90),
@@ -64,6 +87,7 @@ local Config = {
 	LockRadius = 140, -- px around the screen centre a target must be inside
 	LockLOS = true, -- only lock targets you can see
 	LockSkipTeam = true,
+	LockOffset = 0, -- studs added to the aim point (fine-tune for odd rigs)
 	LockRing = true, -- draw the capture radius
 
 	-- Overlay
@@ -123,6 +147,8 @@ local Hooks = {
 	GetHealth = nil, -- function(player, character) -> health, maxHealth
 	GetTeam = nil, -- function(player, character) -> anything that identifies the team
 	CharacterFolder = nil, -- Instance holding rigs named after players (default: Workspace)
+	GetRoot = nil, -- function(character) -> BasePart  (the part that tracks the body)
+	GetHead = nil, -- function(character) -> BasePart
 }
 
 local RigConfig = {
@@ -135,6 +161,29 @@ local RigConfig = {
 	MaxHealthValueNames = { "MaxHealth", "MaxHP" },
 	TeamKeys = { "Team", "TeamName", "TeamId", "TeamID", "team", "Side", "Faction" },
 }
+
+local RigBase = { Root = RigConfig.RootPartNames, Head = RigConfig.HeadPartNames, Torso = RigConfig.TorsoPartNames }
+local function applyRigNames()
+	local function merge(str, base)
+		local out = {}
+		for n in string.gmatch(str or "", "[^,]+") do
+			n = n:match("^%s*(.-)%s*$")
+			if n ~= "" then
+				out[#out + 1] = n
+			end
+		end
+		for _, b in base do
+			out[#out + 1] = b
+		end
+		return out
+	end
+	RigConfig.RootPartNames = merge(Config.RootNames, RigBase.Root)
+	RigConfig.HeadPartNames = merge(Config.HeadNames, RigBase.Head)
+	RigConfig.TorsoPartNames = merge(Config.TorsoNames, RigBase.Torso)
+end
+applyRigNames()
+
+local DistUnits = { Meters = { 0.28, " m" }, Feet = { 0.92, " ft" }, Studs = { 1, " st" } }
 
 local Theme = {
 	Bg = Color3.fromRGB(17, 18, 20),
@@ -282,7 +331,7 @@ local function resolveRoot(model, allowLargest)
 	if named then
 		return named
 	end
-	if model.PrimaryPart then
+	if model:IsA("Model") and model.PrimaryPart then
 		return model.PrimaryPart
 	end
 	if allowLargest == false then
@@ -303,7 +352,7 @@ end
 
 -- Rejects map props that merely share a name with a player.
 local function plausible(model)
-	if model:FindFirstChildOfClass("Humanoid") or model.PrimaryPart then
+	if model:FindFirstChildOfClass("Humanoid") or (model:IsA("Model") and model.PrimaryPart) then
 		return true
 	end
 	for _, n in RigConfig.RootPartNames do
@@ -410,14 +459,29 @@ local function createTag(overlay, chamFolder)
 	}, chamFolder)
 	return {
 		Box = box, Fill = fill, Brackets = brackets, Horiz = horiz, Label = label, Name = name, BarBack = barBack,
-		Ghost = ghost, Hp = hp, Info = info, Tracer = tracer, Chams = chams,
+		Ghost = ghost, Hp = hp, Info = info, Tracer = tracer, Chams = chams, Parts = {}, Folder = chamFolder,
 	}
 end
 
+local function hideTrail(t)
+	local lines = t.Trail
+	if lines then
+		for i = 1, t.TrailUsed or 0 do
+			lines[i].Visible = false
+		end
+	end
+	t.TrailUsed = 0
+end
+
 local function resetTag(t)
+	hideTrail(t)
 	t.Box.Visible, t.Label.Visible, t.Tracer.Visible = false, false, false
 	t.Chams.Enabled = false
 	t.Chams.Adornee = nil
+	for _, a in t.Parts do
+		a.Visible = false
+		a.Adornee = nil
+	end
 end
 
 local function destroyTag(t)
@@ -425,6 +489,12 @@ local function destroyTag(t)
 	t.Label:Destroy()
 	t.Tracer:Destroy()
 	t.Chams:Destroy()
+	for _, l in t.Trail or {} do
+		l:Destroy()
+	end
+	for _, a in t.Parts do
+		a:Destroy()
+	end
 end
 
 local function createArrow(overlay)
@@ -734,6 +804,7 @@ function HUD:_unbind(rec)
 	table.clear(rec.Body)
 	table.clear(rec.BodyVol)
 	table.clear(rec.Bones)
+	rec.Trail = nil
 	self:_hide(rec)
 end
 
@@ -742,7 +813,7 @@ function HUD:_resolveCharacter(p)
 	local hook = Hooks.GetCharacter
 	if hook then
 		local ok, r = pcall(hook, p)
-		return if ok and typeof(r) == "Instance" and r:IsA("Model") then r else nil
+		return if ok and typeof(r) == "Instance" and (r:IsA("Model") or r:IsA("Folder")) then r else nil
 	end
 	local c = p.Character
 	if c and c:IsDescendantOf(Workspace) then
@@ -750,13 +821,13 @@ function HUD:_resolveCharacter(p)
 	end
 	local folder = Hooks.CharacterFolder or Workspace
 	local f = folder:FindFirstChild(p.Name) or folder:FindFirstChild(p.DisplayName)
-	if f and f:IsA("Model") and plausible(f) then
+	if f and (f:IsA("Model") or f:IsA("Folder")) and plausible(f) then
 		return f
 	end
 	for _, child in folder:GetChildren() do
 		if child:IsA("Folder") or child:IsA("Model") then
 			local g = child:FindFirstChild(p.Name) or child:FindFirstChild(p.DisplayName)
-			if g and g:IsA("Model") and plausible(g) then
+			if g and (g:IsA("Model") or g:IsA("Folder")) and plausible(g) then
 				return g
 			end
 		end
@@ -811,8 +882,21 @@ function HUD:_bind(rec, character, force)
 		if hrp and hrp:IsDescendantOf(character) then
 			root = hrp
 		end
+		if Hooks.GetRoot then
+			local okR, r = pcall(Hooks.GetRoot, character)
+			if okR and typeof(r) == "Instance" and r:IsA("BasePart") and r:IsDescendantOf(character) then
+				root = r
+			end
+		end
 		local head = findPart(character, RigConfig.HeadPartNames)
-		if head and (head.Position - root.Position).Magnitude > 10 then
+		rec.HeadFixed = false
+		if Hooks.GetHead then
+			local okH2, hh = pcall(Hooks.GetHead, character)
+			if okH2 and typeof(hh) == "Instance" and hh:IsA("BasePart") and hh:IsDescendantOf(character) then
+				head, rec.HeadFixed = hh, true
+			end
+		end
+		if head and not rec.HeadFixed and (head.Position - root.Position).Magnitude > 10 then
 			head = nil -- a same-named part somewhere else
 		end
 		rec.Char, rec.Root, rec.Head, rec.Pending = character, root, head, nil
@@ -1091,30 +1175,29 @@ function HUD:_scan(rec)
 		return
 	end
 	local rp = root.Position
-	local parts = {}
-	local minX, maxX, minY, maxY, minZ, maxZ = math.huge, -math.huge, math.huge, -math.huge, math.huge, -math.huge
+	local all, vis = {}, {}
 	local joints = {}
 	local wantBones = Config.Skeleton
 	for _, d in ch:GetDescendants() do
 		if d:IsA("BasePart") then
-			local cf = d.CFrame
-			local p = cf.Position
-			if (p - rp).Magnitude <= 14 and isBodyPart(d) then
-				local s = d.Size * 0.5
-				local rx, ry, rz = cf.RightVector, cf.UpVector, cf.LookVector
-				local ex = math.abs(rx.X) * s.X + math.abs(ry.X) * s.Y + math.abs(rz.X) * s.Z
-				local ey = math.abs(rx.Y) * s.X + math.abs(ry.Y) * s.Y + math.abs(rz.Y) * s.Z
-				local ez = math.abs(rx.Z) * s.X + math.abs(ry.Z) * s.Y + math.abs(rz.Z) * s.Z
-				minX, maxX = math.min(minX, p.X - ex), math.max(maxX, p.X + ex)
-				minY, maxY = math.min(minY, p.Y - ey), math.max(maxY, p.Y + ey)
-				minZ, maxZ = math.min(minZ, p.Z - ez), math.max(maxZ, p.Z + ez)
+			if (d.Position - rp).Magnitude <= 14 and isBodyPart(d) then
 				local sz = d.Size
-				parts[#parts + 1] = { d, sz.X * sz.Y * sz.Z }
+				local e = { d, sz.X * sz.Y * sz.Z }
+				all[#all + 1] = e
+				if d.Transparency < 0.9 then
+					vis[#vis + 1] = e -- invisible hitboxes must not stretch the box or draw bones
+				end
 			end
 		elseif wantBones then
 			-- each joint: parent part, child part, joint position in the parent's space, in the child's space
-			if d:IsA("Motor6D") then
+			if d:IsA("JointInstance") then
 				joints[#joints + 1] = { d.Part0, d.Part1, d.C0.Position, d.C1.Position }
+			elseif d:IsA("WeldConstraint") then
+				local p0, p1 = d.Part0, d.Part1
+				if p0 and p1 then
+					local mid = (p0.Position + p1.Position) * 0.5 -- no pivot stored: use the midpoint
+					joints[#joints + 1] = { p0, p1, p0.CFrame:PointToObjectSpace(mid), p1.CFrame:PointToObjectSpace(mid) }
+				end
 			elseif JointConstraints[d.ClassName] then
 				local a0, a1 = d.Attachment0, d.Attachment1
 				if a0 and a1 and a0.Parent and a1.Parent then
@@ -1124,17 +1207,79 @@ function HUD:_scan(rec)
 		end
 	end
 
+	local parts = if #vis >= 2 then vis else all -- rigs that are fully invisible fall back to everything
+	local minX, maxX, minY, maxY, minZ, maxZ = math.huge, -math.huge, math.huge, -math.huge, math.huge, -math.huge
+	for _, e in parts do
+		local d = e[1]
+		local cf, s = d.CFrame, d.Size * 0.5
+		local p = cf.Position
+		local rx, ry, rz = cf.RightVector, cf.UpVector, cf.LookVector
+		local ex = math.abs(rx.X) * s.X + math.abs(ry.X) * s.Y + math.abs(rz.X) * s.Z
+		local ey = math.abs(rx.Y) * s.X + math.abs(ry.Y) * s.Y + math.abs(rz.Y) * s.Z
+		local ez = math.abs(rx.Z) * s.X + math.abs(ry.Z) * s.Y + math.abs(rz.Z) * s.Z
+		minX, maxX = math.min(minX, p.X - ex), math.max(maxX, p.X + ex)
+		minY, maxY = math.min(minY, p.Y - ey), math.max(maxY, p.Y + ey)
+		minZ, maxZ = math.min(minZ, p.Z - ez), math.max(maxZ, p.Z + ez)
+	end
+
 	local h = maxY - minY
-	if #parts == 0 or h < 1 or h > 30 then
-		rec.BoxW, rec.BoxH, rec.CenterY = 3.6, 6.2, 0 -- nothing sensible to measure
+	local measured = #parts > 0 and h >= 1 and h <= 30
+	if not measured then
+		rec.BoxW, rec.BoxH, rec.CenterY, rec.FeetOffset = 3.6, 6.2, 0, nil -- nothing sensible to measure
 		rec.HeadOffset, rec.HeadRadius = 2.4, 0.7
 	else
 		h *= 1.04
 		rec.BoxH = h
 		rec.BoxW = math.clamp(math.max(maxX - minX, maxZ - minZ) * 0.8, h * 0.3, h * 0.7)
 		rec.CenterY = math.clamp((minY + maxY) * 0.5 - rp.Y, -h, h)
+		rec.FeetOffset = minY - rp.Y
 		rec.HeadRadius = math.min(0.7, h * 0.12)
 		rec.HeadOffset = math.max(maxY - rec.HeadRadius - rp.Y, 0.5)
+	end
+
+	-- Head / torso sanity. A name match can be wrong (a whole-body mesh called "Head", a hitbox
+	-- far from the body), so each is checked against the measured height and re-searched by name.
+	if measured then
+		local function sane(p, frac)
+			local s = p.Size
+			return math.max(s.X, s.Y, s.Z) <= h * frac
+		end
+		local hd = rec.Head
+		if not ((rec.HeadFixed and hd and hd.Parent) or (hd and hd.Parent and hd:IsDescendantOf(ch) and sane(hd, 0.45) and hd.Position.Y >= minY + h * 0.55)) then
+			hd = nil
+			local topY = -math.huge
+			for _, e in all do
+				local p = e[1]
+				local n = p.Name:lower()
+				if n:find("head", 1, true) and not (n:find("phone", 1, true) or n:find("hat", 1, true) or n:find("hair", 1, true)) then
+					local y = p.Position.Y
+					if sane(p, 0.45) and y >= minY + h * 0.55 and y > topY then
+						hd, topY = p, y
+					end
+				end
+			end
+		end
+		rec.Head = hd
+		local tr = rec.Torso
+		if not (tr and tr.Parent and tr:IsDescendantOf(ch)) then
+			tr = root
+		end
+		if tr == root or not sane(tr, 0.75) then
+			-- the root is often a feet-level or oversized part: look for a part that is named like a torso
+			local best, bestD = nil, math.huge
+			for _, e in all do
+				local p = e[1]
+				local n = p.Name:lower()
+				if p ~= hd and sane(p, 0.75) and (n:find("torso", 1, true) or n:find("chest", 1, true) or n:find("spine", 1, true) or n:find("trunk", 1, true)) then
+					local dd = math.abs(p.Position.Y - (minY + h * 0.62))
+					if dd < bestD then
+						best, bestD = p, dd
+					end
+				end
+			end
+			tr = best or root
+		end
+		rec.Torso = tr
 	end
 
 	-- largest body parts (aim fallback + skeleton fallback)
@@ -1151,7 +1296,6 @@ function HUD:_scan(rec)
 		self:_buildBones(rec, joints)
 	end
 end
-
 -- Builds the skeleton as bones between JOINT PIVOTS, not part centres, so it reads like a
 -- real skeleton. Every bone is stored as {partA, localOffsetA, partB, localOffsetB}, so it
 -- follows the animation each frame with no extra work.
@@ -1164,7 +1308,23 @@ function HUD:_buildBones(rec, joints)
 	local bones = rec.Bones
 	table.clear(bones)
 	local function ok(p)
-		return p ~= nil and p:IsA("BasePart") and p:IsDescendantOf(ch) and isBodyPart(p)
+		-- invisible helper parts (hitboxes, the root) never get a bone of their own
+		return p ~= nil and p:IsA("BasePart") and p:IsDescendantOf(ch) and isBodyPart(p) and p.Transparency < 0.9
+	end
+	local rootPos = root.Position
+	-- far end of a leaf part: the mirrored joint, or (for centre pivots) the end of its longest axis away from the root
+	local function leafEnd(part, s)
+		if s.Magnitude >= 0.25 then
+			return -s
+		end
+		local sz = part.Size
+		local axis = if sz.X >= sz.Y and sz.X >= sz.Z then Vector3.xAxis elseif sz.Y >= sz.Z then Vector3.yAxis else Vector3.zAxis
+		local half = axis * (math.max(sz.X, sz.Y, sz.Z) * 0.5)
+		local cf = part.CFrame
+		if (cf * half - rootPos).Magnitude >= (cf * -half - rootPos).Magnitude then
+			return half
+		end
+		return -half
 	end
 	local function add(pa, oa, pb, ob)
 		if #bones >= BONES then
@@ -1191,7 +1351,11 @@ function HUD:_buildBones(rec, joints)
 		local kids = byParent[p1]
 		local s = j.o1 -- this part's own joint, in this part's space
 		if not kids then
-			add(p1, s, p1, -s) -- leaf: the joint to the opposite end of the part
+			if p1 == rec.Head then
+				add(p1, s, p1, Vector3.zero) -- neck to the middle of the head, not through it
+			else
+				add(p1, s, p1, leafEnd(p1, s)) -- leaf: the joint to the far end of the part
+			end
 		else
 			local upper, lower = {}, {}
 			for _, k in kids do
@@ -1217,6 +1381,17 @@ function HUD:_buildBones(rec, joints)
 		end
 	end
 
+	local style = Config.SkeletonStyle
+	if style ~= "Joints" then
+		if style == "Stick" then
+			return self:_stickBones(rec)
+		end
+		-- Auto: keep the joint skeleton only if it looks like a body
+		if self:_pruneBones(rec) < 0.55 or #bones < 6 then
+			return self:_stickBones(rec)
+		end
+		return
+	end
 	if #bones < 5 then
 		-- Universal fallback for ANY rig: spanning tree over the largest body parts, from the root.
 		table.clear(bones)
@@ -1249,6 +1424,71 @@ function HUD:_buildBones(rec, joints)
 				bones[#bones + 1] = { nodes[bi], Vector3.zero, nodes[bj], Vector3.zero }
 			end
 		end
+	end
+end
+
+-- Drops bones that are far too long or leave the body's bounds; returns how much of the
+-- body's height the remaining bones cover (0..1).
+function HUD:_pruneBones(rec)
+	local bones, rp = rec.Bones, rec.Root.Position
+	local feet, h = rec.FeetOffset, rec.BoxH
+	if not feet then
+		return 0
+	end
+	local lo, hi = rp.Y + feet - 0.15 * h, rp.Y + feet + 1.15 * h
+	local maxR = h * 0.9
+	local minY, maxY = math.huge, -math.huge
+	for i = #bones, 1, -1 do
+		local b = bones[i]
+		local a, c = b[1].CFrame * b[2], b[3].CFrame * b[4]
+		local bad = (a - c).Magnitude > h * 0.6 or a.Y < lo or a.Y > hi or c.Y < lo or c.Y > hi
+			or Vector3.new(a.X - rp.X, 0, a.Z - rp.Z).Magnitude > maxR or Vector3.new(c.X - rp.X, 0, c.Z - rp.Z).Magnitude > maxR
+		if bad then
+			table.remove(bones, i)
+		else
+			minY, maxY = math.min(minY, a.Y, c.Y), math.max(maxY, a.Y, c.Y)
+		end
+	end
+	return if #bones > 0 then (maxY - minY) / h else 0
+end
+
+-- A fixed-proportion stick figure sized from the measured body and hung off the root part.
+-- Always looks right; it follows the root, not the animation.
+function HUD:_stickBones(rec)
+	local root, bones = rec.Root, rec.Bones
+	table.clear(bones)
+	local h = rec.BoxH
+	local rp = root.Position
+	local feet = rec.FeetOffset or (rec.CenterY - h * 0.5)
+	local look = root.CFrame.LookVector
+	local fwd = Vector3.new(look.X, 0, look.Z)
+	fwd = if fwd.Magnitude > 0.05 then fwd.Unit else Vector3.zAxis
+	local side = Vector3.new(-fwd.Z, 0, fwd.X)
+	local base = Vector3.new(rp.X, rp.Y + feet, rp.Z)
+	local cf = root.CFrame
+	local function P(s, u) -- sideways and up, as fractions of the body height
+		return cf:PointToObjectSpace(base + side * (s * h) + Vector3.yAxis * (u * h))
+	end
+	local neck, pelvis = P(0, 0.84), P(0, 0.52)
+	local function add(a, b)
+		bones[#bones + 1] = { root, a, root, b }
+	end
+	local head = rec.Head
+	if head and head.Parent then
+		bones[#bones + 1] = { root, neck, head, Vector3.zero }
+	else
+		add(neck, P(0, 0.93))
+	end
+	add(neck, pelvis)
+	for _, s in { -1, 1 } do
+		local shoulder = P(s * 0.11, 0.82)
+		add(neck, shoulder)
+		add(shoulder, P(s * 0.15, 0.62))
+		add(P(s * 0.15, 0.62), P(s * 0.16, 0.44))
+		local hip = P(s * 0.06, 0.5)
+		add(pelvis, hip)
+		add(hip, P(s * 0.07, 0.27))
+		add(P(s * 0.07, 0.27), P(s * 0.07, 0.03))
 	end
 end
 
@@ -1286,10 +1526,20 @@ function HUD:_aimPoint(rec, which)
 		return rpos + Vector3.new(0, rec.HeadOffset, 0)
 	end
 	local t = rec.Torso
-	if t and t.Parent then
+	local rpos = root.Position
+	if t and t.Parent and t ~= root then
 		return t.Position
 	end
-	return root.Position + Vector3.new(0, rec.CenterY, 0)
+	-- the root can sit at the feet or the hips on custom rigs: only trust it if it is mid-body
+	local feet = rec.FeetOffset
+	if feet then
+		local frac = (-feet) / rec.BoxH
+		if frac < 0.3 or frac > 0.75 then
+			return rpos + Vector3.new(0, feet + rec.BoxH * 0.66, 0)
+		end
+		return rpos
+	end
+	return rpos + Vector3.new(0, rec.CenterY, 0)
 end
 
 ----------------------------------------------------------------------
@@ -1381,6 +1631,9 @@ function HUD:_updateRec(rec, c)
 	if dist < c.nearest then
 		c.nearest = dist
 	end
+	if Config.Trails then
+		self:_sampleTrail(rec, root)
+	end
 
 	-- manual perspective projection (independent of Camera.ViewportSize, which can be stale)
 	local z = d:Dot(c.look)
@@ -1436,6 +1689,101 @@ function HUD:_updateRec(rec, c)
 	end
 end
 
+-- Trails: the feet position is sampled ~12 times per trail length and drawn as fading segments.
+local TRAIL_SEGS = 16
+
+function HUD:_sampleTrail(rec, root)
+	local now = os.clock()
+	local tr = rec.Trail
+	if not tr then
+		tr = {}
+		rec.Trail = tr
+	end
+	local life = math.clamp(Config.TrailTime, 0.5, 8)
+	while tr[1] and now - tr[1].t > life do
+		table.remove(tr, 1)
+	end
+	local pos = root.Position + Vector3.new(0, (rec.FeetOffset or (rec.CenterY - rec.BoxH * 0.5)) + 0.3, 0)
+	local last = tr[#tr]
+	if last then
+		if (pos - last.p).Magnitude > 25 then
+			table.clear(tr) -- teleport or respawn: don't draw a line across the map
+		elseif now - last.t < life / 12 then
+			return
+		end
+	end
+	tr[#tr + 1] = { p = pos, t = now }
+end
+
+function HUD:_drawTrail(rec, tag, color, c)
+	local lines = tag.Trail
+	if not lines then
+		lines = {}
+		tag.Trail = lines
+	end
+	local used = 0
+	local tr = rec.Trail
+	if tr and #tr > 0 then
+		local now = os.clock()
+		local life = math.clamp(Config.TrailTime, 0.5, 8)
+		local thick = math.clamp(Config.TrailThick, 1, 4)
+		local camPos, look, right, up, cx, cy, k = c.camPos, c.look, c.right, c.up, c.cx, c.cy, c.k
+		local n = #tr
+		local headPos = rec.Root.Position + Vector3.new(0, (rec.FeetOffset or (rec.CenterY - rec.BoxH * 0.5)) + 0.3, 0)
+		local x0, y0
+		for i = 1, n + 1 do
+			local p, t
+			if i <= n then
+				p, t = tr[i].p, tr[i].t
+			else
+				p, t = headPos, now
+			end
+			local dv = p - camPos
+			local z = dv:Dot(look)
+			local x, y
+			if z > 0.1 then
+				x, y = cx + dv:Dot(right) / z * k, cy - dv:Dot(up) / z * k
+			end
+			if x and x0 and used < TRAIL_SEGS then
+				used += 1
+				local line = lines[used]
+				if not line then
+					line = New("Frame", { AnchorPoint = Vector2.new(0.5, 0.5), BorderSizePixel = 0 }, self.overlay)
+					lines[used] = line
+				end
+				local dx, dy = x - x0, y - y0
+				line.Position = UDim2.fromOffset((x + x0) * 0.5, (y + y0) * 0.5)
+				line.Size = UDim2.fromOffset(math.sqrt(dx * dx + dy * dy), thick)
+				line.Rotation = math.deg(math.atan2(dy, dx))
+				line.BackgroundColor3 = color
+				line.BackgroundTransparency = 0.25 + 0.75 * math.clamp((now - t) / life, 0, 1)
+				line.Visible = true
+			end
+			x0, y0 = x, y
+		end
+	end
+	for i = used + 1, tag.TrailUsed or 0 do
+		lines[i].Visible = false
+	end
+	tag.TrailUsed = used
+end
+
+function HUD:_nameOf(rec)
+	local p = rec.Player
+	local un = p.Name
+	local dn = tostring(p.DisplayName or "")
+	if dn == "" then
+		dn = un
+	end
+	local s = Config.NameSource
+	if s == "Username" then
+		return un
+	elseif s == "Both" and dn ~= un then
+		return dn .. " (@" .. un .. ")"
+	end
+	return dn
+end
+
 function HUD:_layout(rec, tag, px, py, z, dist, c)
 	local detail = dist <= Config.DetailRange * (rec.Detail and 1.1 or 1)
 	rec.Detail = detail
@@ -1446,23 +1794,30 @@ function HUD:_layout(rec, tag, px, py, z, dist, c)
 	if not ap or ap.color ~= color or ap.style ~= Config.BoxStyle or ap.ver ~= self.cfgVer then
 		rec.Applied = { color = color, style = Config.BoxStyle, ver = self.cfgVer }
 		local full = Config.BoxStyle == "Full"
+		local bt, bc = math.clamp(Config.BoxThickness, 1, 4), math.clamp(Config.BoxCorner, 0.1, 0.5)
 		for i, b in tag.Brackets do
 			b.BackgroundColor3 = color
 			if tag.Horiz[i] then
-				b.Size = UDim2.new(full and 1 or 0.3, 0, 0, 2)
+				b.Size = UDim2.new(full and 1 or bc, 0, 0, bt)
 			else
-				b.Size = UDim2.new(0, 2, full and 1 or 0.22, 0)
+				b.Size = UDim2.new(0, bt, full and 1 or bc * 0.73, 0)
 			end
 		end
 		tag.Fill.BackgroundColor3 = color
+		tag.Fill.BackgroundTransparency = math.clamp(Config.BoxFill, 0.5, 1)
 		tag.Tracer.BackgroundColor3 = color
-		tag.Chams.FillColor, tag.Chams.OutlineColor = color, color
+		tag.Tracer.BackgroundTransparency = 1 - math.clamp(Config.TracerOpacity, 0.1, 1)
+		local cc = if Config.ChamsColorMode == "Fixed" then Config.ChamsColor else color
+		tag.Chams.FillColor, tag.Chams.OutlineColor = cc, cc
 		tag.Chams.FillTransparency = Config.ChamsFill
+		tag.Chams.OutlineTransparency = Config.ChamsOutline
+		tag.Chams.DepthMode = if Config.ChamsDepth == "Normal" then Enum.HighlightDepthMode.Occluded else Enum.HighlightDepthMode.AlwaysOnTop
+		tag.Name.Text = self:_nameOf(rec)
 		self.chamsDirty = true
 	end
 
 	local s = c.k / z
-	local w, h = math.max(s * rec.BoxW, 8), math.max(s * rec.BoxH, 14)
+	local w, h = math.max(s * rec.BoxW * Config.BoxWidth, 8), math.max(s * rec.BoxH * Config.BoxHeight, 14)
 
 	tag.Box.Visible = Config.Boxes
 	if Config.Boxes then
@@ -1483,10 +1838,11 @@ function HUD:_layout(rec, tag, px, py, z, dist, c)
 			tag.Ghost.Size = UDim2.fromScale(rec.Ghost, 1)
 		end
 		if self.tick and Config.Distance then
-			local m = math.floor(dist * 0.28)
-			if m ~= rec.LastDistM then
-				rec.LastDistM = m
-				tag.Info.Text = m .. " m"
+			local u = DistUnits[Config.DistUnit] or DistUnits.Meters
+			local m = math.floor(dist * u[1])
+			if m ~= rec.LastDistM or rec.LastUnit ~= Config.DistUnit then
+				rec.LastDistM, rec.LastUnit = m, Config.DistUnit
+				tag.Info.Text = m .. u[2]
 			end
 		end
 	end
@@ -1497,8 +1853,14 @@ function HUD:_layout(rec, tag, px, py, z, dist, c)
 		local ty = oy >= c.cy and py + h * 0.5 or py - h * 0.5
 		local dx, dy = px - ox, ty - oy
 		tag.Tracer.Position = UDim2.fromOffset((px + ox) * 0.5, (ty + oy) * 0.5)
-		tag.Tracer.Size = UDim2.fromOffset(math.sqrt(dx * dx + dy * dy), 1)
+		tag.Tracer.Size = UDim2.fromOffset(math.sqrt(dx * dx + dy * dy), math.clamp(Config.TracerThick, 1, 4))
 		tag.Tracer.Rotation = math.deg(math.atan2(dy, dx))
+	end
+
+	if Config.Trails and detail then
+		self:_drawTrail(rec, tag, color, c)
+	elseif tag.TrailUsed and tag.TrailUsed > 0 then
+		hideTrail(tag)
 	end
 
 	if Config.Skeleton and detail and dist <= Config.SkeletonRange then
@@ -1555,14 +1917,16 @@ function HUD:_drawSkeleton(rec, color, c)
 		rec.Skel = skel
 	end
 	local lines = skel.Lines
-	if skel.Color ~= color then
-		skel.Color = color
+	if skel.Color ~= color or skel.Ver ~= self.cfgVer then
+		skel.Color, skel.Ver = color, self.cfgVer
+		local tr = 1 - math.clamp(Config.SkeletonOpacity, 0.2, 1)
 		for _, l in lines do
 			l.BackgroundColor3 = color
+			l.BackgroundTransparency = tr
 		end
 	end
 	-- about 0.12 studs wide on screen: thicker up close, never thinner than a hairline
-	local thick = math.clamp(c.k * 0.12 / math.max(rec.Dist, 1), 1.2, 3)
+	local thick = math.clamp(c.k * 0.12 / math.max(rec.Dist, 1), 1.2, 3) * math.clamp(Config.SkeletonThick, 0.5, 3)
 	local camPos, look, right, up, cx, cy, k = c.camPos, c.look, c.right, c.up, c.cx, c.cy, c.k
 	local used = 0
 	for i = 1, n do
@@ -1639,8 +2003,43 @@ function HUD:_updateChams()
 	end
 	for _, rec in self.list do
 		local t = rec.Tag
-		if t and t.Chams.Enabled ~= rec.ChamWant then
-			t.Chams.Enabled = rec.ChamWant
+		if t then
+			-- keep the highlight on the live rig (it can be swapped or rebuilt while the tag stays up)
+			local useHl = rec.ChamWant and Config.ChamsStyle ~= "Parts"
+			local want = useHl and rec.Char or nil
+			if want and not want:IsA("Model") then
+				want = rec.Root
+			end
+			if t.Chams.Adornee ~= want then
+				t.Chams.Adornee = want
+			end
+			if t.Chams.Enabled ~= useHl then
+				t.Chams.Enabled = useHl
+			end
+			-- "Parts" style: a see-through box on each big body part. Independent of Highlight,
+			-- so it works where the Highlight limit or a rig's setup stops Highlights drawing.
+			local pl, n = t.Parts, 0
+			if rec.ChamWant and Config.ChamsStyle == "Parts" then
+				local color = t.Chams.FillColor
+				local tr = math.clamp(Config.ChamsFill, 0.3, 0.9)
+				for _, p in rec.Body do
+					if p.Parent then
+						n += 1
+						local a = pl[n]
+						if not a then
+							a = New("BoxHandleAdornment", { AlwaysOnTop = true, ZIndex = 1 }, t.Folder)
+							pl[n] = a
+						end
+						a.Adornee, a.Size, a.Color3, a.Transparency, a.Visible = p, p.Size, color, tr, true
+					end
+				end
+			end
+			for i = n + 1, #pl do
+				if pl[i].Visible then
+					pl[i].Visible = false
+					pl[i].Adornee = nil
+				end
+			end
 		end
 	end
 end
@@ -1874,6 +2273,9 @@ function HUD:_applyLock(camera, dt)
 	local rec = self.lockRec
 	local engaged = rec ~= nil and rec.Alive and self:_lockWanted()
 	local aim = engaged and self:_aimPoint(rec, Config.LockPart) or nil
+	if aim and Config.LockOffset ~= 0 then
+		aim += Vector3.new(0, Config.LockOffset, 0)
+	end
 	if not aim then
 		self.lockW = 0
 		return
@@ -3070,14 +3472,36 @@ function HUD:_buildMenu()
 	cfgToggle(esp, "Health", "Health")
 	cfgToggle(esp, "Distance", "Distance")
 	cfgToggle(esp, "Skeleton", "Skeleton")
+	cfgSegment(esp, "Skeleton style", "SkeletonStyle", { "Auto", "Joints", "Stick" })
 	cfgSlider(esp, "Skeleton range", "SkeletonRange", 50, 1500, { step = 50, format = studs })
 	cfgToggle(esp, "Chams", "Chams")
+	cfgSegment(esp, "Chams style", "ChamsStyle", { "Highlight", "Parts" })
 	cfgSlider(esp, "Chams range", "ChamsRange", 100, 25000, { step = 100, format = studs })
 	cfgToggle(esp, "Arrows", "Arrows")
 	cfgToggle(esp, "Proximity alert", "Alert")
 	cfgSlider(esp, "Alert radius", "AlertRadius", 10, 400, { step = 10, format = studs })
 	cfgToggle(esp, "Tracers", "Tracers")
+	cfgToggle(esp, "Movement trails", "Trails")
 	cfgToggle(esp, "Dim behind cover", "VisTint")
+	esp.Section("Style")
+	cfgSlider(esp, "Box thickness", "BoxThickness", 1, 4, { step = 1, format = px })
+	cfgSlider(esp, "Corner length", "BoxCorner", 0.1, 0.5, { step = 0.05, format = function(v) return math.floor(v * 100 + 0.5) .. "%" end })
+	cfgSlider(esp, "Box fill", "BoxFill", 0.5, 1, { step = 0.05, format = function(v) return math.floor((1 - v) * 100 + 0.5) .. "%" end })
+	cfgSlider(esp, "Box width", "BoxWidth", 0.5, 1.6, { step = 0.05, format = function(v) return math.floor(v * 100 + 0.5) .. "%" end })
+	cfgSlider(esp, "Box height", "BoxHeight", 0.5, 1.6, { step = 0.05, format = function(v) return math.floor(v * 100 + 0.5) .. "%" end })
+	cfgSegment(esp, "Name shows", "NameSource", { "Display", "Username", "Both" })
+	cfgSegment(esp, "Distance unit", "DistUnit", { "Meters", "Feet", "Studs" })
+	cfgSlider(esp, "Skeleton thickness", "SkeletonThick", 0.5, 3, { step = 0.25, format = function(v) return math.floor(v * 100 + 0.5) .. "%" end })
+	cfgSlider(esp, "Skeleton opacity", "SkeletonOpacity", 0.2, 1, { step = 0.05, format = function(v) return math.floor(v * 100 + 0.5) .. "%" end })
+	cfgSlider(esp, "Chams fill", "ChamsFill", 0.3, 1, { step = 0.05, format = function(v) return math.floor((1 - v) * 100 + 0.5) .. "%" end })
+	cfgSlider(esp, "Chams outline", "ChamsOutline", 0, 1, { step = 0.05, format = function(v) return math.floor((1 - v) * 100 + 0.5) .. "%" end })
+	cfgSegment(esp, "Chams depth", "ChamsDepth", { "Through walls", "Normal" })
+	cfgSegment(esp, "Chams color", "ChamsColorMode", { "Team", "Fixed" })
+	esp.Swatches("Fixed chams", EnemyPalette, function() return Config.ChamsColor end, function(c) Config.ChamsColor = c end)
+	cfgSlider(esp, "Tracer thickness", "TracerThick", 1, 4, { step = 1, format = px })
+	cfgSlider(esp, "Tracer opacity", "TracerOpacity", 0.1, 1, { step = 0.05, format = function(v) return math.floor(v * 100 + 0.5) .. "%" end })
+	cfgSlider(esp, "Trail length", "TrailTime", 0.5, 8, { step = 0.5, format = function(v) return ("%.1f s"):format(v) end })
+	cfgSlider(esp, "Trail thickness", "TrailThick", 1, 4, { step = 1, format = px })
 	esp.Section("Colors")
 	esp.Swatches("Enemy", EnemyPalette, function() return Config.EnemyColor end, function(c) Config.EnemyColor = c end)
 	esp.Swatches("Teammate", AllyPalette, function() return Config.AllyColor end, function(c) Config.AllyColor = c end)
@@ -3096,6 +3520,7 @@ function HUD:_buildMenu()
 	cfgSlider(aim, "Strength", "LockStrength", 0.05, 0.6, { step = 0.05, format = function(v) return math.floor(v * 100 + 0.5) .. "%" end })
 	cfgSlider(aim, "Max turn speed", "LockMaxTurn", 60, 720, { step = 10, format = function(v) return math.floor(v) .. "°/s" end })
 	cfgSlider(aim, "Capture radius", "LockRadius", 40, 500, { step = 10, format = px })
+	cfgSlider(aim, "Aim offset", "LockOffset", -3, 3, { step = 0.1, format = function(v) return ("%+.1f studs"):format(v) end })
 	cfgToggle(aim, "Line of sight", "LockLOS")
 	cfgToggle(aim, "Skip teammates", "LockSkipTeam")
 	cfgToggle(aim, "Show capture ring", "LockRing")
@@ -3236,6 +3661,32 @@ function HUD:_buildMenu()
 		local n = self:ImportConfig(field.Text)
 		menu.Say(n > 0 and ("Imported %d settings"):format(n) or "That doesn't look like a config string")
 	end)
+	st.Section("Rig compatibility")
+	local function nameField(label, key)
+		local fld = st.Field(label)
+		fld.PlaceholderText = "extra names, comma separated"
+		fld.Text = Config[key]
+		self.jan:Add(fld.FocusLost:Connect(function()
+			Config[key] = fld.Text
+			applyRigNames()
+			for _, rec in self.list do
+				if rec.Char then
+					self:_bind(rec, rec.Char, true)
+				end
+			end
+		end))
+	end
+	nameField("Root part names", "RootNames")
+	nameField("Head part names", "HeadNames")
+	nameField("Torso part names", "TorsoNames")
+	st.Button("Re-detect all rigs", function()
+		for _, rec in self.list do
+			if rec.Char then
+				self:_bind(rec, rec.Char, true)
+			end
+		end
+		menu.Say("Re-reading every rig")
+	end)
 	st.Section("Tools")
 	st.Button("Print diagnostics to output", function()
 		self:PrintDiagnostics()
@@ -3248,6 +3699,7 @@ function HUD:_buildMenu()
 		for k, v in Defaults do
 			Config[k] = v
 		end
+		applyRigNames()
 		self.lockHeld, self.lockToggled = false, false
 		menu.SetAccent(Config.Accent)
 		menu.Fit()

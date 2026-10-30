@@ -1,6 +1,6 @@
 --!strict
 --[[
-	TacticalHUD v5 — spectator / teammate / debug overlay with a tabbed menu.
+	TacticalHUD v6 — spectator / teammate / debug overlay with a tabbed menu.
 
 	Place as a LocalScript in StarterPlayer > StarterPlayerScripts.
 
@@ -72,7 +72,8 @@ local Config = {
 	FadeTime = 0.2,
 
 	-- Box
-	BoxWidthStuds = 3.6,
+	BoxFromModel = true, -- size boxes from each model's bounding box (custom rigs)
+	BoxWidthStuds = 3.6, -- fallback / used when BoxFromModel is off
 	BoxHeightStuds = 6.2,
 	MinBoxWidth = 10,
 	MinBoxHeight = 18,
@@ -155,6 +156,35 @@ local Config = {
 	MenuOpacity = 0.06,
 	AnimatedBorder = true,
 	Accent = Color3.fromRGB(0, 220, 255),
+}
+
+-- Custom character / rig support ------------------------------------------------
+-- The HUD no longer needs a Humanoid, Head or HumanoidRootPart. For each target it
+--   * finds the character via Hooks.GetCharacter, else Player.Character, else a model
+--     named after the player in Hooks.CharacterFolder (default: Workspace),
+--   * picks a root part from RootPartNames (then PrimaryPart, then the largest part),
+--   * picks a head part from HeadPartNames (else tags attach to the root),
+--   * sizes the box from the model's real bounding box (BoxFromModel),
+--   * reads health from Hooks.GetHealth, else a Humanoid, else Attributes
+--     (HealthAttribute / MaxHealthAttribute) on the character then the player,
+--     else NumberValues named HealthValueName / MaxHealthValueName.
+-- Set hooks from your own code, e.g. at the top of this script:
+--   Hooks.GetCharacter = function(player) return workspace.Rigs:FindFirstChild(player.Name) end
+--   Hooks.GetHealth    = function(player, character) return character:GetAttribute("HP"), 150 end
+local Hooks: {
+	GetCharacter: ((Player) -> Model?)?,
+	GetHealth: ((Player, Model) -> (number, number))?, -- polled ~1x/second per target
+	CharacterFolder: Instance?,
+} = {}
+
+local RigConfig = {
+	RootPartNames = { "HumanoidRootPart", "RootPart", "Root", "Torso", "UpperTorso", "LowerTorso", "Hitbox" },
+	HeadPartNames = { "Head", "head", "Face" },
+	HealthAttribute = "Health",
+	MaxHealthAttribute = "MaxHealth",
+	HealthValueName = "Health",
+	MaxHealthValueName = "MaxHealth",
+	RescanInterval = 1, -- seconds between per-target re-checks (one target per frame)
 }
 
 local Defaults = table.clone(Config)
@@ -244,6 +274,48 @@ function Utils.New(className: string, props: { [string]: any }, parent: Instance
 	return inst
 end
 local New = Utils.New
+
+-- Rig helpers (custom characters). Run at bind / rescan time, never per frame. --
+function Utils.FindPart(model: Model, names: { string }): BasePart?
+	for _, n in names do
+		local p = model:FindFirstChild(n, true)
+		if p and p:IsA("BasePart") then
+			return p
+		end
+	end
+	return nil
+end
+
+-- Root = first matching name, else PrimaryPart, else the largest part by volume.
+function Utils.ResolveRoot(model: Model): BasePart?
+	local named = Utils.FindPart(model, RigConfig.RootPartNames)
+	if named then
+		return named
+	end
+	if model.PrimaryPart then
+		return model.PrimaryPart
+	end
+	local best: BasePart? = nil
+	local bestVol = 0
+	for _, d in model:GetDescendants() do
+		if d:IsA("BasePart") then
+			local s = d.Size
+			local vol = s.X * s.Y * s.Z
+			if vol > bestVol then
+				best, bestVol = d, vol
+			end
+		end
+	end
+	return best
+end
+
+function Utils.ResolveHead(model: Model): BasePart?
+	return Utils.FindPart(model, RigConfig.HeadPartNames)
+end
+
+local function asNumber(x: any, default: number): number
+	return if type(x) == "number" then x else default
+end
 
 -- A bind is an Enum.KeyCode or an Enum.UserInputType (mouse button).
 function Utils.BindMatches(input: InputObject, bind: EnumItem): boolean
@@ -1624,6 +1696,16 @@ type Record = {
 	Occluded: boolean,
 	NextOcclusionCheck: number,
 	BindToken: number,
+	-- custom-rig data
+	Pending: Model?, -- character currently being bound (stops the rescan re-binding it)
+	Refresh: (() -> ())?, -- health refresher (polled for Hooks.GetHealth)
+	Polled: boolean,
+	NextScan: number,
+	BoxW: number, -- studs, from the model's bounding box
+	BoxH: number,
+	CenterY: number, -- bounding-box centre relative to the root part
+	TagOffset: Vector3, -- name tag offset above the anchor part
+	RigInfo: string, -- shown in Misc: which parts / health source were found
 	-- style cache: properties are only rewritten when one of these changes
 	Tier: number,
 	Focused: boolean,
@@ -1762,6 +1844,9 @@ function HUDManager.new()
 	self._destroyed = false
 	self._janitor = Utils.NewJanitor()
 	self._records = {} :: { [Player]: Record }
+	self._list = {} :: { Record } -- same records as an array, for the time-sliced rescan
+	self._cursor, self._localTimer = 0, 0
+	self._lastLocal = nil :: Model?
 	self._count = 0
 	self._cfgVersion = 0
 	self._focusRec = nil :: Record?
@@ -1843,6 +1928,7 @@ end
 -- Tag lifecycle ---------------------------------------------------------
 function HUDManager._bindTag(self: any, rec: Record, tag: Tag)
 	tag.Gui.Adornee = rec.Anchor
+	tag.Gui.StudsOffset = rec.TagOffset
 	tag.Chams.Adornee = rec.Character
 	tag.Name.Text = rec.Player.DisplayName
 	rec.GhostFrac = rec.HealthFrac
@@ -1878,47 +1964,205 @@ function HUDManager._unbindCharacter(self: any, rec: Record)
 	rec.BindToken += 1
 	rec.CharJanitor:Clean()
 	rec.Character, rec.Anchor, rec.Root = nil, nil, nil
+	rec.Pending, rec.Refresh, rec.Polled = nil, nil, false
 	rec.Alive = false
 	rec.Occluded = false
 	self:_releaseTag(rec) -- immediate: the anchor is gone, nothing to fade
 	self:_releaseArrow(rec)
 end
 
+-- Finds a player's character: custom hook, then Player.Character, then a model
+-- named after the player in the configured folder (or Workspace).
+function HUDManager._resolveCharacter(self: any, player: Player): Model?
+	local hook = Hooks.GetCharacter
+	if hook then
+		local ok, result = pcall(hook, player)
+		return if ok and typeof(result) == "Instance" and result:IsA("Model") then result else nil
+	end
+	local c = player.Character
+	if c and c:IsDescendantOf(Workspace) then
+		return c
+	end
+	local folder = Hooks.CharacterFolder or Workspace
+	local f = folder:FindFirstChild(player.Name)
+	if f and f:IsA("Model") then
+		return f
+	end
+	return nil
+end
+
+-- Box size / centre / tag height from the model's real bounding box.
+function HUDManager._measure(self: any, rec: Record)
+	local ch, root, anchor = rec.Character, rec.Root, rec.Anchor
+	if not (ch and root and anchor) or not Config.BoxFromModel then
+		return
+	end
+	local cf, size = ch:GetBoundingBox()
+	local h = math.max(size.Y * 1.06, 1)
+	rec.BoxH = h
+	rec.BoxW = math.clamp(math.max(size.X, size.Z) * 0.8, h * 0.3, h * 0.7)
+	rec.CenterY = cf.Position.Y - root.Position.Y
+	local top = cf.Position.Y + h * 0.5
+	rec.TagOffset = Vector3.new(0, math.max(top - anchor.Position.Y, 0.5) + 0.3, 0)
+	local tag = rec.Tag
+	if tag then
+		tag.Gui.StudsOffset = rec.TagOffset
+	end
+end
+
+-- Time-sliced re-check, one target per frame: catches characters that custom
+-- systems spawn/replace without firing CharacterAdded, refreshes box size, and
+-- polls health when a GetHealth hook is used.
+function HUDManager._rescan(self: any, rec: Record, now: number)
+	if now < rec.NextScan then
+		return
+	end
+	rec.NextScan = now + RigConfig.RescanInterval
+	local resolved = self:_resolveCharacter(rec.Player)
+	local cur = rec.Character
+	if cur and not cur:IsDescendantOf(Workspace) then
+		self:_unbindCharacter(rec)
+		cur = nil
+	end
+	if resolved and resolved ~= cur and resolved ~= rec.Pending then
+		self:_bindCharacter(rec, resolved)
+	elseif not resolved and cur then
+		self:_unbindCharacter(rec)
+	elseif cur then
+		self:_measure(rec)
+		if rec.Polled and rec.Refresh then
+			rec.Refresh()
+		end
+	end
+end
+
 function HUDManager._bindCharacter(self: any, rec: Record, character: Model)
 	self:_unbindCharacter(rec)
 	local token = rec.BindToken
-	-- Parts replicate slightly after CharacterAdded; wait off the hot path.
+	rec.Pending = character
+	-- Custom rigs can stream parts in late: wait (off the hot path) for a root part.
 	task.spawn(function()
-		local hum = character:WaitForChild("Humanoid", 10) :: Humanoid?
-		local head = character:WaitForChild("Head", 10) :: BasePart?
-		local root = character:WaitForChild("HumanoidRootPart", 10) :: BasePart?
-		if self._destroyed or rec.BindToken ~= token or not hum or not head or not root then
+		local root: BasePart? = nil
+		for _ = 1, 30 do -- up to ~3 s
+			root = Utils.ResolveRoot(character)
+			if root or self._destroyed or rec.BindToken ~= token then
+				break
+			end
+			task.wait(0.1)
+		end
+		if self._destroyed or rec.BindToken ~= token then
 			return
 		end
-		rec.Character, rec.Anchor, rec.Root = character, head, root
+		if not root then
+			rec.Pending = nil -- nothing usable yet; the rescan will retry
+			return
+		end
 
-		-- Event-driven health: runs only when Health/MaxHealth change.
+		local head = Utils.ResolveHead(character)
+		local hum = character:FindFirstChildWhichIsA("Humanoid", true)
+		if not hum then -- stock rigs add the Humanoid a moment after the parts
+			for _ = 1, 10 do
+				task.wait(0.1)
+				hum = character:FindFirstChildWhichIsA("Humanoid", true)
+				if hum or self._destroyed or rec.BindToken ~= token then
+					break
+				end
+			end
+			if self._destroyed or rec.BindToken ~= token then
+				return
+			end
+		end
+		rec.Character, rec.Anchor, rec.Root = character, head or root, root
+		rec.Pending = nil
+
+		-- Pick the health source. Event-driven wherever the rig allows it.
+		local player = rec.Player
+		local getHealth: (() -> (any, any))? = nil
+		local source = "none (always full)"
+		local hook = Hooks.GetHealth
+		local hA, mA = RigConfig.HealthAttribute, RigConfig.MaxHealthAttribute
+		if hook then
+			getHealth = function()
+				local ok, h, m = pcall(hook, player, character)
+				if ok then
+					return h, m
+				end
+				return nil, nil
+			end
+			rec.Polled = true
+			source = "Hooks.GetHealth (polled)"
+		elseif hum then
+			getHealth = function()
+				return hum.Health, hum.MaxHealth
+			end
+			source = "Humanoid"
+		elseif character:GetAttribute(hA) ~= nil then
+			getHealth = function()
+				return character:GetAttribute(hA), character:GetAttribute(mA)
+			end
+			source = "character attribute '" .. hA .. "'"
+		elseif player:GetAttribute(hA) ~= nil then
+			getHealth = function()
+				return player:GetAttribute(hA), player:GetAttribute(mA)
+			end
+			source = "player attribute '" .. hA .. "'"
+		else
+			local hv = character:FindFirstChild(RigConfig.HealthValueName, true)
+			if hv and hv:IsA("ValueBase") then
+				local mv = character:FindFirstChild(RigConfig.MaxHealthValueName, true)
+				getHealth = function()
+					return (hv :: any).Value, if mv and mv:IsA("ValueBase") then (mv :: any).Value else nil
+				end
+				source = "Value '" .. hv.Name .. "'"
+			end
+		end
+
 		local first = true
 		local function refresh()
-			local frac = math.clamp(hum.Health / math.max(hum.MaxHealth, 1), 0, 1)
+			local h, m = 100, 100
+			if getHealth then
+				local rh, rm = getHealth()
+				h = asNumber(rh, 100)
+				m = math.max(asNumber(rm, math.max(h, 100)), 1)
+			end
+			local frac = math.clamp(h / m, 0, 1)
 			if frac > rec.GhostFrac or first then
 				rec.GhostFrac = frac -- heals / first read: no trail
 			elseif frac < rec.HealthFrac then
 				rec.GhostHold = os.clock() + Config.GhostDelay
 			end
 			first = false
-			rec.Health, rec.MaxHealth = hum.Health, hum.MaxHealth
+			rec.Health, rec.MaxHealth = h, m
 			rec.HealthFrac = frac
-			rec.Alive = hum.Health > 0
+			rec.Alive = getHealth == nil or h > 0
 			rec.LastDistM = -1 -- re-render the info line on the next tick
 			local tag = rec.Tag
 			if tag then
 				applyHealth(tag, frac, rec.GhostFrac)
 			end
 		end
+		rec.Refresh = refresh
 		refresh()
-		rec.CharJanitor:Add(hum.HealthChanged:Connect(refresh))
-		rec.CharJanitor:Add(hum:GetPropertyChangedSignal("MaxHealth"):Connect(refresh))
+		if hum and not hook then
+			rec.CharJanitor:Add(hum.HealthChanged:Connect(refresh))
+			rec.CharJanitor:Add(hum:GetPropertyChangedSignal("MaxHealth"):Connect(refresh))
+		elseif not hook and getHealth then
+			if source:find("player attribute", 1, true) then
+				rec.CharJanitor:Add(player:GetAttributeChangedSignal(hA):Connect(refresh))
+				rec.CharJanitor:Add(player:GetAttributeChangedSignal(mA):Connect(refresh))
+			elseif source:find("character attribute", 1, true) then
+				rec.CharJanitor:Add(character:GetAttributeChangedSignal(hA):Connect(refresh))
+				rec.CharJanitor:Add(character:GetAttributeChangedSignal(mA):Connect(refresh))
+			else
+				local hv = character:FindFirstChild(RigConfig.HealthValueName, true)
+				if hv and hv:IsA("ValueBase") then
+					rec.CharJanitor:Add((hv :: any).Changed:Connect(refresh))
+				end
+			end
+		end
+
+		rec.RigInfo = ("root=%s  head=%s  health=%s"):format(root.Name, if head then head.Name else "none (tag on root)", source)
+		self:_measure(rec)
 	end)
 end
 
@@ -1933,9 +2177,13 @@ function HUDManager._addPlayer(self: any, player: Player)
 		Alive = false, Occluded = false,
 		NextOcclusionCheck = os.clock() + math.random() * Config.OcclusionInterval, -- spread raycasts across frames
 		BindToken = 0, Tier = -1, Focused = false, Accent = nil, AppliedCfg = -1, LastDistM = -1,
+		Pending = nil, Refresh = nil, Polled = false, NextScan = 0,
+		BoxW = Config.BoxWidthStuds, BoxH = Config.BoxHeightStuds, CenterY = 0,
+		TagOffset = Config.TagStudsOffset, RigInfo = "not bound yet",
 		CharJanitor = Utils.NewJanitor(), PlayerJanitor = Utils.NewJanitor(),
 	}
 	self._records[player] = rec
+	table.insert(self._list, rec)
 	self._count += 1
 
 	rec.PlayerJanitor:Add(player.CharacterAdded:Connect(function(char)
@@ -1944,8 +2192,9 @@ function HUDManager._addPlayer(self: any, player: Player)
 	rec.PlayerJanitor:Add(player.CharacterRemoving:Connect(function()
 		self:_unbindCharacter(rec)
 	end))
-	if player.Character then
-		self:_bindCharacter(rec, player.Character)
+	local existing = self:_resolveCharacter(player)
+	if existing then
+		self:_bindCharacter(rec, existing)
 	end
 	self:_playersChanged()
 end
@@ -1956,6 +2205,10 @@ function HUDManager._removePlayer(self: any, player: Player)
 		return
 	end
 	self._records[player] = nil
+	local idx = table.find(self._list, rec)
+	if idx then
+		table.remove(self._list, idx)
+	end
 	self._count -= 1
 	if self._focusRec == rec then
 		self._focusRec = nil
@@ -2063,8 +2316,12 @@ function HUDManager._layout(self: any, rec: Record, tag: Tag, vx: number, vy: nu
 
 	-- Pixel size from FOV: studs * (viewportH / (2 * depth * tan(fov/2))).
 	local s = self._k / depth
-	local w = math.max(s * Config.BoxWidthStuds, Config.MinBoxWidth)
-	local h = math.max(s * Config.BoxHeightStuds, Config.MinBoxHeight)
+	local bw, bh = Config.BoxWidthStuds, Config.BoxHeightStuds
+	if Config.BoxFromModel then
+		bw, bh = rec.BoxW, rec.BoxH
+	end
+	local w = math.max(s * bw, Config.MinBoxWidth)
+	local h = math.max(s * bh, Config.MinBoxHeight)
 
 	if Config.ShowBoxes then
 		tag.Box.Position = UDim2.fromOffset(vx, vy)
@@ -2399,7 +2656,8 @@ function HUDManager.Update(self: any, dt: number)
 			nTotal += 1
 			if self:_passesMode(rec.Player) then
 				nMode += 1
-				local pos = root.Position
+				-- root + bounding-box centre offset, so boxes/tracers centre on the whole rig
+				local pos = root.Position + Vector3.new(0, rec.CenterY, 0)
 				local d = pos - camPos
 				local dSq = d:Dot(d)
 				if dSq <= maxDistSq then -- distance cull
@@ -2538,6 +2796,24 @@ function HUDManager.Update(self: any, dt: number)
 		self:_updateCard(camPos)
 	end
 
+	-- Rig upkeep: one target per frame (character swaps, box size, polled health)
+	local list = self._list
+	local nList = #list
+	if nList > 0 then
+		self._cursor = self._cursor % nList + 1
+		self:_rescan(list[self._cursor], now)
+	end
+	-- Keep our own (possibly custom) character out of occlusion rays
+	self._localTimer += dt
+	if self._localTimer >= 1 then
+		self._localTimer = 0
+		local lc = self:_resolveCharacter(localPlayer)
+		if lc ~= self._lastLocal then
+			self._lastLocal = lc
+			self._rayParams.FilterDescendantsInstances = if lc then { lc } else {}
+		end
+	end
+
 	self._fpsFrames += 1
 	self._fpsTimer += dt
 	if self._fpsTimer >= 0.5 then
@@ -2557,10 +2833,11 @@ function HUDManager.Update(self: any, dt: number)
 		end
 		local dbg = self._debugInfo
 		if dbg and self._menu.Gui.Enabled then
+			local fr = self._focusRec :: Record?
 			dbg.Text = string.format(
-				"tracked   %d\npass mode %d\nin range  %d\non screen %d\nin radius %d\nvisible   %d\narrows    %d\npool free %d/%d",
+				"tracked   %d\npass mode %d\nin range  %d\non screen %d\nin radius %d\nvisible   %d\narrows    %d\npool free %d/%d\n\nfocus rig: %s",
 				stats.Total, stats.Mode, stats.Range, stats.Screen, stats.Radius, stats.Visible, stats.Arrows,
-				pool:FreeCount(), pool:Capacity()
+				pool:FreeCount(), pool:Capacity(), if fr then fr.RigInfo else "(aim near a target)"
 			)
 		end
 	end
@@ -2648,26 +2925,32 @@ function HUDManager.Spectate(self: any, player: Player?)
 	if self._freecam then
 		self:SetFreecam(false)
 	end
-	if not player then
-		self._specPlayer = nil
-		local char = localPlayer.Character
-		local hum = char and char:FindFirstChildOfClass("Humanoid")
+	-- CameraSubject accepts a Humanoid or a BasePart, so rigs without a
+	-- Humanoid are followed by their root part instead.
+	local function follow(char: Model?)
+		if not char then
+			return
+		end
+		local hum = char:FindFirstChildWhichIsA("Humanoid", true)
 		if hum then
 			camera.CameraSubject = hum
+			return
 		end
+		local part = Utils.ResolveRoot(char)
+		if part then
+			camera.CameraSubject = part
+		end
+	end
+	if not player then
+		self._specPlayer = nil
+		follow(self:_resolveCharacter(localPlayer))
 	else
 		self._specPlayer = player
-		local function follow(char: Model?)
-			local hum = char and char:FindFirstChildOfClass("Humanoid")
-			if hum then
-				camera.CameraSubject = hum
-			end
-		end
-		follow(player.Character)
+		follow(self:_resolveCharacter(player))
 		self._specJanitor:Add(player.CharacterAdded:Connect(function(char)
-			local hum = char:WaitForChild("Humanoid", 10) :: Humanoid?
-			if hum and self._specPlayer == player and not self._destroyed then
-				camera.CameraSubject = hum
+			task.wait(0.3) -- let the rig's parts replicate
+			if self._specPlayer == player and not self._destroyed then
+				follow(char)
 			end
 		end))
 	end
@@ -2831,6 +3114,7 @@ function HUDManager._buildMenu(self: any)
 	vis.Section("ESP")
 	cfgToggle(vis, "Boxes", "ShowBoxes")
 	cfgCycle(vis, "Box style", "BoxStyle", { "Corners", "Full" })
+	cfgToggle(vis, "Box from model size", "BoxFromModel")
 	cfgToggle(vis, "Tracers", "ShowTracers")
 	cfgCycle(vis, "Tracer origin", "TracerOrigin", { "Bottom", "Center", "Top" })
 	cfgToggle(vis, "Names", "ShowNames")
@@ -3005,7 +3289,7 @@ function HUDManager._buildMenu(self: any)
 	cfgSlider(misc, "Box height", "BoxHeightStuds", 2, 12, { Step = 0.1, Format = studs })
 	cfgSlider(misc, "Arrow ring size", "ArrowRadius", 0.4, 0.95, { Step = 0.01 })
 	misc.Section("Culling counters (live)")
-	self._debugInfo = misc.Info(124)
+	self._debugInfo = misc.Info(190)
 	misc.Section("Tools")
 	misc.Button("Print counters to output", function()
 		local s = self._stats
